@@ -30,7 +30,9 @@
 param(
     [int]$Port = 8003,
     [int]$WaitSeconds = 45,
-    [int]$MaxStartsPerHour = 6
+    [int]$MaxStartsPerHour = 6,
+    [switch]$Stop,
+    [switch]$Restart
 )
 
 $ErrorActionPreference = 'Stop'
@@ -74,6 +76,37 @@ function Get-RecentStarts {
 }
 
 Note "ensure: port=$Port pid=$PID"
+
+if ($Stop -or $Restart) {
+    # Deliberately NOT part of the default path. The scheduled task runs this script every ten
+    # minutes; if it killed whatever held the port, it would restart the service every ten minutes
+    # forever. Stopping is a decision a person makes, so it needs a switch.
+    $listening = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+    if (-not $listening) {
+        Note "nothing listening on $Port"
+    }
+    foreach ($connection in $listening) {
+        $processId = $connection.OwningProcess
+        Note "STOP pid $processId on port $Port"
+        try {
+            Stop-Process -Id $processId -Force -ErrorAction Stop
+        } catch {
+            Note ("FAILED to stop pid $processId : " + $_.Exception.Message)
+            Note ("It runs at RunLevel Highest, so stopping it needs an elevated prompt.")
+            exit 1
+        }
+    }
+    for ($attempt = 1; $attempt -le 20; $attempt++) {
+        if (-not (Test-Port $Port)) { break }
+        Start-Sleep -Seconds 1
+    }
+    if (Test-Port $Port) {
+        Note "FAILED: port $Port is still held after stopping"
+        exit 1
+    }
+    if ($listening) { Note "stopped cleanly" }
+    if ($Stop) { exit 0 }
+}
 
 # Already up: nothing to do. This is the common case and must stay silent in the history.
 if (Test-Port $Port) {

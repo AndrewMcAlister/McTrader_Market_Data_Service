@@ -427,10 +427,24 @@ is idempotent:
 ```powershell
 # elevated
 cd <project>
-.\install-task.ps1 -Restart
+.\scripts\Ensure-MarketDataService.ps1 -Restart    # stop, then start with the latest code
+.\scripts\Ensure-MarketDataService.ps1 -Stop       # stop only
 ```
 
-It stops whatever holds the port, then starts the service through the same launcher the task uses.
+`.\install-task.ps1 -Restart` does the same thing; the launcher is the one that knows about the port.
+
+The launcher takes three modes, and the difference between them is the whole trap:
+
+| Call | Does | Used by |
+|---|---|---|
+| `Ensure-MarketDataService.ps1` | starts only if nothing holds the port | the scheduled task, every 10 minutes |
+| `Ensure-MarketDataService.ps1 -Stop` | stops what holds the port | you |
+| `Ensure-MarketDataService.ps1 -Restart` | stop, then start | you |
+
+The default does **not** kill on sight, because that same script is the watchdog on a 10-minute
+trigger — it would restart the service every ten minutes forever. Stopping is a decision a person
+makes, so it needs a switch. This mirrors McTrader, whose start script kills a stale listener first:
+the reason it can is that its task is boot-only and runs once.
 
 **Task Scheduler's "End" does not stop this service.** It ends the *task*, and the launcher starts the
 service *detached* — deliberately, so a task that finishes in two seconds does not take the service
