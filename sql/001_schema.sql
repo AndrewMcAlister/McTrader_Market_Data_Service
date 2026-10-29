@@ -220,3 +220,50 @@ IF NOT EXISTS (SELECT 1 FROM dbo.ColumnDoc WHERE TableName = 'SymbolPriceCache' 
             'Always NULL on this vendor.',
             'EODHD''s /real-time/ payload carries open/high/low/close/previousClose/volume but no quote side. The column exists so the absence is a recorded vendor fact rather than a missing feature.');
 GO
+
+
+/* ------------------------------------------------------------------ */
+/* View: SymbolPriceCache in local time                                */
+/* ------------------------------------------------------------------ */
+/* The two timestamp columns record when the *vendor* observed the price and when this service fetched
+ * it. Those are instants, and UTC is the honest frame for an instant -- which is why the caches stayed
+ * UTC when the logging and usage tables moved to local time. What was missing was a way to read them
+ * without doing the arithmetic by hand, and a view is the right size for that: no storage, cannot go
+ * stale, and the stored values are untouched.
+ *
+ * The conversion labels the naive datetime2 as UTC and then converts it to the zone, applying the DST
+ * rules in force on THAT ROW's date:
+ *
+ *     CAST((x AT TIME ZONE 'UTC') AT TIME ZONE 'AUS Eastern Standard Time' AS datetime2(7))
+ *
+ * A single SYSDATETIMEOFFSET() offset would be wrong for every row written in the other half of the
+ * year. datetime2(7) rather than (3) so the conversion is exact and can be checked with an equality.
+ *
+ * The zone is hard-coded because SQL Server has no portable "this machine's Windows zone" function.
+ * If this instance moves timezone, this view has to move with it.
+ */
+CREATE OR ALTER VIEW dbo.SymbolPriceCacheLocal
+AS
+SELECT
+    SymbolCode,
+    Venue,
+    Price,
+    Bid,
+    Ask,
+    PreviousClose,
+    ChangePct,
+    -- The stored instants, unchanged and still named for what they are.
+    AsOfUtc,
+    LastUpdatedUtc,
+    -- The same instants as this site's wall clock. The names deliberately drop the "Utc" suffix:
+    -- a column called AsOfUtc holding Sydney time is how a reader gets misled.
+    CAST((AsOfUtc AT TIME ZONE 'UTC') AT TIME ZONE 'AUS Eastern Standard Time' AS datetime2(7))
+        AS AsOfLocal,
+    CAST((LastUpdatedUtc AT TIME ZONE 'UTC') AT TIME ZONE 'AUS Eastern Standard Time' AS datetime2(7))
+        AS LastUpdatedLocal,
+    -- For one hour a year local time is ambiguous; this says which side of the change a row is on.
+    DATEPART(TZOFFSET, (LastUpdatedUtc AT TIME ZONE 'UTC') AT TIME ZONE 'AUS Eastern Standard Time')
+        AS LastUpdatedOffsetMinutes,
+    Source
+FROM dbo.SymbolPriceCache
+GO

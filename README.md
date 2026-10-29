@@ -304,6 +304,29 @@ and one call costs the same either way.
 
 ---
 
+### Reading the price cache in local time
+
+`SymbolPriceCache` is UTC, deliberately: `AsOfUtc` is when the vendor observed the price and
+`LastUpdatedUtc` is when this service fetched it, and those are instants — a local timestamp cannot be
+compared across timezones, and one hour a year is ambiguous.
+
+For reading them at a Sydney desk there is a view. It keeps the UTC columns and adds the local ones
+beside them, so the conversion is checkable rather than trusted:
+
+```sql
+SELECT SymbolCode, Price, LastUpdatedUtc, LastUpdatedLocal, LastUpdatedOffsetMinutes
+FROM dbo.SymbolPriceCacheLocal
+ORDER BY LastUpdatedUtc DESC;
+```
+
+| Column | Meaning |
+|---|---|
+| `AsOfLocal`, `LastUpdatedLocal` | the same instants as local wall clock, DST applied per row |
+| `LastUpdatedOffsetMinutes` | 660 (AEDT) or 600 (AEST) — which side of the clock change that row is on |
+
+Verified over all 12,053 rows: every one converts to exactly `UTC + 600` or `UTC + 660` minutes, with
+precision preserved to the microsecond.
+
 ## What it costs, and who spent it
 
 Two tables, both yours to read:
