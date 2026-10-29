@@ -304,6 +304,88 @@ and one call costs the same either way.
 
 ---
 
+## What it costs, and who spent it
+
+Two tables, both yours to read:
+
+| Table | Holds |
+|---|---|
+| `dbo.RequestTypes` | the **measured tariff**: one row per vendor endpoint, with `CostBasis` (`flat`, `per_call`, `per_symbol`, `free`), `CostEach`, and the measurement evidence |
+| `dbo.EODHDUsage` | the **ledger**: one row per `(UsageDate, Caller, RequestType)` with `Calls`, `Symbols`, `CostTotal`, `FirstSeen`, `LastSeen` |
+
+### The tariff is the authority, not the code
+
+Per-call costs used to be literals at each call site (`units=1`, `units=100`). They are now read from
+`dbo.RequestTypes` at startup, so a re-measured price is a row update rather than a release — and the
+number a reader checks is the number the code spends.
+
+The four bases are not interchangeable, and getting one wrong is silent:
+
+| Basis | Meaning | Measured |
+|---|---|---|
+| `per_symbol` | multipled by symbols in the request | 3 tickers in one call billed **3**, so batching saves wall-clock and nothing else |
+| `flat` | once per call, whatever the size | the whole-market feed is **100** whether it returns 12,737 rows or 527 |
+| `per_call` | once per call, whatever the window | 5-day and 30-day `/eod/` both cost **1** |
+| `free` | zero | `/user` costs nothing, which is why reconciliation is free |
+
+An unpriced row (`CostEach IS NULL`) is recorded with cost 0 **and a warning**: unpriced is not free,
+and a call that vanished would be the accounting hole these tables exist to close.
+
+### Who spent it
+
+Every data endpoint attributes its spend to the `X-MarketData-Caller` header, falling back to the path:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8003/price/AAPL -Headers @{ 'X-MarketData-Caller' = 'minictrader' }
+```
+
+```
+caller        request type   calls  symbols  cost
+mctrader      /real-time/        1        1     1
+minictrader   /real-time/        1        1     1
+http:/price   /real-time/        1        1     1     <- no header, attributed by path
+```
+
+Without a header the row still lands, attributed to the path. That is deliberate: an unattributed call
+is a question worth asking, and a call that vanished would answer nothing.
+
+### Failed calls cost money too
+
+A rejected request **is billed** — measured: a 404 from `/eod/` cost 1, a 404 from `/intraday/` cost 5.
+So a 4xx is recorded before the error is raised. This closed a real gap: the client used to count only
+successes, so a run of rejections was invisible in the accounting while still spending quota. A
+transport failure (the request never landed) is the one case that costs nothing and is not recorded.
+
+### Where to see it
+
+`GET /stats` reports `usage_today` from the ledger — totals, by request type, and by caller:
+
+```json
+"usage_today": {
+  "date": "2026-10-29", "calls": 261, "symbols": 261, "cost": 733,
+  "by_request_type": [{"request_type": "/screener", "calls": 108, "cost": 540}, ...],
+  "by_caller": [{"caller": "mctrader", "calls": 2, "cost": 2}, ...]
+}
+```
+
+The process counters (`vendor.units`) are still there but reset on restart; the ledger does not. When
+the two disagree, the ledger is right.
+
+### Reconciliation is free
+
+`/user` returns the vendor's own counter and costs nothing, so the ledger can be checked against the
+vendor at any time:
+
+```
+apiRequests 2798 / dailyRateLimit 100000
+```
+
+### The day boundary is UTC
+
+`UsageDate` is the **UTC** date, matching `SYSUTCDATETIME()` and the rows already in the table. A Sydney
+morning therefore lands on the previous UTC date — correct against a vendor that resets on UTC, but it
+means "today" in the table is not "today" at the desk.
+
 ## The daily job
 
 ```

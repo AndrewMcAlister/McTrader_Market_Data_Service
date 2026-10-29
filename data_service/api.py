@@ -39,6 +39,7 @@ from .eodhd import EodhdError
 from .products import MarketDataError, Products
 from .secrets_service import EodhdKeyStore, KeyringUnavailable
 from .store import Store, StoreBusy
+from .usage import set_caller
 
 log = logging.getLogger("data_service.api")
 
@@ -92,6 +93,16 @@ class BarsRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # app
 # ---------------------------------------------------------------------------
+
+def _attribute(request: Request, fallback: str) -> None:
+    """Record who caused any vendor spend during this request.
+
+    The header is the point: a shared service's spend is only accountable if you can say which book
+    spent it. Without a header the path stands in, so the ledger still shows *what* was asked even
+    when the client did not identify itself -- and an unattributed row is a question worth asking.
+    """
+    set_caller(request.headers.get("X-MarketData-Caller") or fallback)
+
 
 def _products(request: Request) -> Products:
     return request.app.state.products
@@ -206,6 +217,13 @@ def create_app() -> FastAPI:
         products = request.app.state.products
         if products is not None:
             payload.update(products.stats())
+
+        # Today's spend from dbo.EODHDUsage rather than from the process counters: the ledger
+        # survives a restart and is attributable to a caller, which is what accounting needs.
+        try:
+            payload["usage_today"] = store.usage_summary()
+        except Exception as exc:  # noqa: BLE001 - /stats must answer even if the ledger cannot
+            payload["usage_today_error"] = f"{type(exc).__name__}: {exc}"
         return payload
 
     # -- the vendor key -----------------------------------------------------
@@ -334,6 +352,7 @@ def create_app() -> FastAPI:
         asset_class: Optional[str] = Query(
             None, description="shares (default), crypto, indices, ..."),
     ) -> Any:
+        _attribute(request, "http:/price")
         products = _products(request)
         if products is None:
             return JSONResponse(status_code=503,
@@ -349,6 +368,7 @@ def create_app() -> FastAPI:
 
     @app.post("/prices", tags=["market data"])
     def post_prices(request: Request, body: PricesRequest) -> Any:
+        _attribute(request, "http:/prices")
         products = _products(request)
         if products is None:
             return JSONResponse(status_code=503,
@@ -365,6 +385,7 @@ def create_app() -> FastAPI:
 
     @app.post("/atr", tags=["market data"])
     def post_atr(request: Request, body: AtrRequest) -> Any:
+        _attribute(request, "http:/atr")
         products = _products(request)
         if products is None:
             return JSONResponse(status_code=503,
@@ -389,6 +410,7 @@ def create_app() -> FastAPI:
 
     @app.post("/bars", tags=["market data"])
     def post_bars(request: Request, body: BarsRequest) -> Any:
+        _attribute(request, "http:/bars")
         products = _products(request)
         if products is None:
             return JSONResponse(status_code=503,

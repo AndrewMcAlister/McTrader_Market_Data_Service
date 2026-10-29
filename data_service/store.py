@@ -118,6 +118,11 @@ class StoreBusy(RuntimeError):
     """
 
 
+def _utc_today() -> date:
+    """The ledger's day boundary is UTC, matching SYSUTCDATETIME() and the existing rows."""
+    return datetime.now(timezone.utc).date()
+
+
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -472,6 +477,120 @@ class Store:
         finally:
             conn.close()
         return len(payload)
+
+    # -- vendor spend ------------------------------------------------------
+
+    def request_types(self) -> List[Dict[str, Any]]:
+        """The measured tariff. Read once at startup and cached by the caller."""
+        conn = self.connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT RequestType, CostBasis, CostEach, Endpoint, MeasuredAt, Is_Estimated "
+                "FROM dbo.RequestTypes ORDER BY RequestType")
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
+        return [
+            {
+                "request_type": row[0],
+                "cost_basis": row[1],
+                "cost_each": int(row[2]) if row[2] is not None else None,
+                "endpoint": row[3],
+                "measured_at": row[4],
+                "is_estimated": bool(row[5]),
+            }
+            for row in rows
+        ]
+
+    def record_usage(self, *, request_type: str, caller: str, calls: int = 1,
+                     symbols: int = 0, cost: int = 0,
+                     usage_date: Optional[date] = None) -> None:
+        """Add one batch of calls to the daily ledger, merging by (date, caller, type).
+
+        UPDATE-then-INSERT rather than MERGE: MERGE has a well-known race under concurrency, and the
+        INSERT can lose a race here too, so a duplicate-key failure retries the UPDATE once. At this
+        volume a collision is rare; losing the row because of one would be the accounting hole this
+        table exists to close.
+
+        ``FirstSeen`` keeps the earliest and ``LastSeen`` the latest, so a row read later still says
+        when the spend happened rather than when it was last touched.
+        """
+        day = usage_date or _utc_today()
+        update = """
+            UPDATE dbo.EODHDUsage
+               SET Calls = Calls + ?,
+                   Symbols = Symbols + ?,
+                   CostTotal = CostTotal + ?,
+                   FirstSeen = CASE WHEN SYSUTCDATETIME() < FirstSeen
+                                    THEN SYSUTCDATETIME() ELSE FirstSeen END,
+                   LastSeen = CASE WHEN SYSUTCDATETIME() > LastSeen
+                                   THEN SYSUTCDATETIME() ELSE LastSeen END
+             WHERE UsageDate = ? AND Caller = ? AND RequestType = ?
+        """
+        insert = """
+            INSERT INTO dbo.EODHDUsage
+                (UsageDate, Caller, RequestType, Calls, Symbols, CostTotal, FirstSeen, LastSeen)
+            VALUES (?,?,?,?,?,?, SYSUTCDATETIME(), SYSUTCDATETIME())
+        """
+        params = (int(calls), int(symbols), int(cost), day, caller, request_type)
+
+        conn = self.connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(update, *params)
+            if cursor.rowcount == 0:
+                try:
+                    cursor.execute(insert, day, caller, request_type,
+                                   int(calls), int(symbols), int(cost))
+                except pyodbc.IntegrityError:
+                    # Another thread inserted the same key between the UPDATE and the INSERT.
+                    cursor.execute(update, *params)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def usage_summary(self, usage_date: Optional[date] = None) -> Dict[str, Any]:
+        """The day's spend from the ledger: totals, and the breakdowns that explain them."""
+        day = usage_date or _utc_today()
+        conn = self.connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT ISNULL(SUM(Calls),0), ISNULL(SUM(Symbols),0), ISNULL(SUM(CostTotal),0), "
+                "       COUNT(*) "
+                "FROM dbo.EODHDUsage WHERE UsageDate = ?", day)
+            calls, symbols, cost, rowcount = cursor.fetchone()
+
+            cursor.execute(
+                "SELECT RequestType, SUM(Calls), SUM(Symbols), SUM(CostTotal) "
+                "FROM dbo.EODHDUsage WHERE UsageDate = ? "
+                "GROUP BY RequestType ORDER BY SUM(CostTotal) DESC, RequestType", day)
+            by_type = [
+                {"request_type": row[0], "calls": int(row[1] or 0),
+                 "symbols": int(row[2] or 0), "cost": int(row[3] or 0)}
+                for row in cursor.fetchall()
+            ]
+
+            cursor.execute(
+                "SELECT Caller, SUM(Calls), SUM(CostTotal) "
+                "FROM dbo.EODHDUsage WHERE UsageDate = ? "
+                "GROUP BY Caller ORDER BY SUM(CostTotal) DESC, Caller", day)
+            by_caller = [
+                {"caller": row[0], "calls": int(row[1] or 0), "cost": int(row[2] or 0)}
+                for row in cursor.fetchall()
+            ]
+        finally:
+            conn.close()
+        return {
+            "date": day.isoformat(),
+            "calls": int(calls or 0),
+            "symbols": int(symbols or 0),
+            "cost": int(cost or 0),
+            "rows": int(rowcount or 0),
+            "by_request_type": by_type,
+            "by_caller": by_caller,
+        }
 
     def ping(self) -> None:
         """Cheapest possible liveness check: one round trip, no table touched.

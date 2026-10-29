@@ -221,9 +221,40 @@ Completed daily bars.
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /healthz` | `{"status","version","vendor_configured","database","database_ok","database_error"}` |
-| `GET /stats` | counters, vendor units spent, routing outcomes, row counts |
+| `GET /healthz` | `{"status","version","vendor_configured","key_source","database","database_ok","database_error"}` |
+| `GET /stats` | counters, process vendor units, row counts, and **`usage_today`** from the spend ledger |
+| `POST /admin/shutdown` | stop the process from inside it — what `stop.bat` calls |
 | `GET /docs` | OpenAPI UI |
+
+### Tell it who you are: `X-MarketData-Caller`
+
+Every data endpoint records the vendor spend it caused against this header, falling back to the path
+when it is absent:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8003/price/AAPL -Headers @{ 'X-MarketData-Caller' = 'minictrader' }
+```
+
+It costs nothing and makes the shared quota accountable. Send it:
+
+```
+caller        request type   calls  symbols  cost
+mctrader      /real-time/        1        1     1
+minictrader   /real-time/        1        1     1
+http:/price   /real-time/        1        1     1     <- no header, attributed by path
+```
+
+Without it the row still lands, attributed to the path. That is deliberate — an unattributed call is
+a question worth asking, whereas a call that vanished answers nothing.
+
+**Spend is priced from `dbo.RequestTypes`, not from the code.** The four bases behave differently and
+getting one wrong is silent: `per_symbol` multiplies by the batch (3 tickers = 3 units, so batching
+saves time and not quota), while `flat` and `per_call` ignore it entirely (the whole-market feed is 100
+whether it returns 527 rows or 12,737).
+
+**A failed call is still billed.** A 4xx is recorded before the error is raised, because a rejected
+request costs quota — measured: a 404 from `/eod/` cost 1 and a 404 from `/intraday/` cost 5. Only a
+transport failure, where the request never landed, is free and unrecorded.
 
 ---
 

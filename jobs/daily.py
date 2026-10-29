@@ -39,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from data_service import atr as atr_module
 from data_service import config as config_module
 from data_service.eodhd import EodhdClient, EodhdError, bare_symbol
+from data_service.usage import Tariff, UsageLedger, set_caller
 from data_service.store import Store, _float
 
 log = logging.getLogger("data_service.daily")
@@ -338,6 +339,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                 timeout_seconds=settings.eodhd_timeout_seconds,
                 bulk_timeout_seconds=settings.eodhd_bulk_timeout_seconds,
             )
+            # Spend from a job is attributed to the job, not to an HTTP caller, and priced from the
+            # same tariff the API uses -- otherwise a daily bulk pull would be invisible.
+            set_caller("jobs.daily")
+            try:
+                client.recorder = UsageLedger(
+                    store, Tariff.from_rows(store.request_types())).record
+            except Exception as exc:  # noqa: BLE001
+                log.warning("no spend ledger for this run (%s)", exc)
             try:
                 summary["pull"] = pull_bulk(store, client, args.market, dates or None)
             except EodhdError as exc:

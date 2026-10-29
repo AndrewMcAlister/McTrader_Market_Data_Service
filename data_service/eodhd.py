@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+
+from .usage import PURPOSE_REQUEST_TYPE
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -130,6 +132,10 @@ class EodhdClient:
     #: -- but enough to see whether the cache is working.
     calls: Dict[str, int] = field(default_factory=dict)
     units: int = 0
+    #: Called as ``recorder(request_type, symbols)`` and returns the units it cost. Attached by the
+    #: product layer, which loads the tariff from dbo.RequestTypes. ``None`` means the hardcoded unit
+    #: counts below are the only accounting -- which is what a unit test without a database gets.
+    recorder: Optional[Any] = None
 
     def __post_init__(self) -> None:
         if not self.api_key:
@@ -146,8 +152,25 @@ class EodhdClient:
         self.calls[purpose] = self.calls.get(purpose, 0) + 1
         self.units += units
 
+    def _spent(self, purpose: str, units: int, symbols: int = 0) -> None:
+        """Count one billable call, priced from the tariff when a recorder is attached.
+
+        The tariff wins over the literal ``units`` because dbo.RequestTypes carries the measurement
+        and its evidence: a re-measured price should be a row update, not a code change.
+        """
+        cost = units
+        request_type = PURPOSE_REQUEST_TYPE.get(purpose)
+        if self.recorder is not None and request_type:
+            try:
+                priced = self.recorder(request_type, symbols)
+            except Exception:  # noqa: BLE001 - accounting must not fail the call
+                priced = None
+            if priced is not None:
+                cost = int(priced)
+        self._count(purpose, cost)
+
     def _get(self, path: str, params: Dict[str, Any], *, purpose: str,
-             units: int, timeout: Optional[float] = None) -> Any:
+             units: int, symbols: int = 0, timeout: Optional[float] = None) -> Any:
         """One GET, at most one retry, and never on a 4xx.
 
         A 4xx is billed, so retrying it pays twice for the same rejected question. Only a
@@ -178,10 +201,13 @@ class EodhdClient:
                     raise EodhdError(
                         "unparseable", f"200 with a non-JSON body ({exc})",
                         status=200) from exc
-                self._count(purpose, units)
+                self._spent(purpose, units, symbols)
                 return payload
 
-            # 4xx/5xx: billed, so no retry.
+            # 4xx/5xx: billed, so no retry -- and billed, so it is recorded before raising.
+            # Measured: a 404 from /eod/ cost 1 and a 404 from /intraday/ cost 5. A transport
+            # failure below is the one case that costs nothing, because the request never landed.
+            self._spent(purpose, units, symbols)
             raise EodhdError(
                 "http-error",
                 f"HTTP {response.status_code} for /{path}: {response.text[:200]}",
@@ -194,7 +220,7 @@ class EodhdClient:
     def real_time(self, symbol: str, venue: str = "US") -> Dict[str, Any]:
         """One symbol's latest price. Billed 1."""
         ticker = render_symbol(symbol, venue)
-        payload = self._get(f"real-time/{ticker}", {}, purpose="real_time", units=1)
+        payload = self._get(f"real-time/{ticker}", {}, purpose="real_time", units=1, symbols=1)
         if isinstance(payload, list):
             payload = payload[0] if payload else {}
         if not isinstance(payload, dict):
@@ -219,6 +245,7 @@ class EodhdClient:
             {"ex": BULK_REAL_TIME_VENUE},
             purpose="real_time_bulk",
             units=100,
+            symbols=0,
             timeout=self.bulk_timeout_seconds,
         )
         if not isinstance(payload, list):
@@ -242,6 +269,7 @@ class EodhdClient:
             {"from": start, "to": end, "period": "d", "order": "a"},
             purpose="eod",
             units=1,
+            symbols=1,
         )
         if not isinstance(payload, list):
             raise EodhdError("unparseable", f"expected a list, got {type(payload).__name__}")
@@ -264,6 +292,7 @@ class EodhdClient:
             params,
             purpose="eod_bulk",
             units=100,
+            symbols=0,
             timeout=self.bulk_timeout_seconds,
         )
         if not isinstance(payload, list):

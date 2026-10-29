@@ -43,6 +43,7 @@ from .providers import (
     ProviderError, build_router, normalise_asset_class,
 )
 from .store import Store
+from .usage import Tariff, UsageLedger
 
 log = logging.getLogger(__name__)
 
@@ -131,6 +132,19 @@ class Products:
                 "no EODHD API key: the vendor is not in the router. Daily bars and the "
                 "whole-market feed are unavailable; Yahoo and Binance still answer.")
             self.client = None
+
+        # Vendor spend: the tariff comes from dbo.RequestTypes, the record goes to dbo.EODHDUsage.
+        # Neither may stop pricing, so the tariff falls back to empty and the ledger swallows its own
+        # write failures (an unpriced call is recorded with cost 0 rather than not recorded).
+        self.tariff = Tariff()
+        try:
+            self.tariff = Tariff.from_rows(store.request_types())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not read dbo.RequestTypes (%s); spend will be recorded unpriced", exc)
+        self.ledger = UsageLedger(store, self.tariff)
+        if self.client is not None:
+            self.client.recorder = self.ledger.record
+
         # Routing is injectable so a test can supply fakes and stay offline. With no router
         # supplied, EODHD leads and Yahoo/Binance are the fallbacks (see providers.router).
         self.router = router if router is not None else build_router(
