@@ -16,11 +16,15 @@ A price is the reason callers use this service; a usage row is why accounting ca
 ledger write fails, the price still has to be served. So every write is caught, logged once per
 request type, and swallowed -- the in-process counters on the client remain the fallback.
 
-DAY BOUNDARY IS UTC
+DAY BOUNDARY IS LOCAL
 
-``UsageDate`` is the UTC date, matching the existing rows and ``FirstSeen``/``LastSeen``. A Sydney
-morning lands on the previous UTC date, which is correct for a ledger measured against a vendor that
-resets on UTC, but it does mean "today" in the table is not "today" in the office.
+``UsageDate`` and the ``FirstSeen``/``LastSeen`` timestamps are local wall-clock, the same as the
+logging tables. It was UTC, which filed a Sydney morning's spend under the previous day and made
+"today" in the table mean yesterday at the desk.
+
+The trade, stated once: a local date cannot be compared across timezones without knowing this one,
+and the vendor's own quota resets on UTC, so the ledger's day and the vendor's day are offset by the
+number of hours this site is ahead.
 """
 from __future__ import annotations
 
@@ -160,7 +164,8 @@ class UsageLedger:
         return lambda request_type, symbols: self.record(request_type, symbols, caller)
 
 
-def today_utc() -> date:
-    from datetime import datetime, timezone
+def today_local() -> date:
+    """The ledger's day, in local time -- the same boundary the store writes under."""
+    from datetime import datetime
 
-    return datetime.now(timezone.utc).date()
+    return datetime.now().date()

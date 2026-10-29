@@ -118,9 +118,17 @@ class StoreBusy(RuntimeError):
     """
 
 
-def _utc_today() -> date:
-    """The ledger's day boundary is UTC, matching SYSUTCDATETIME() and the existing rows."""
-    return datetime.now(timezone.utc).date()
+def _local_today() -> date:
+    """The ledger's day boundary is LOCAL time, matching SYSDATETIME() and the desk clock.
+
+    It was UTC, which meant a Sydney morning's spend was filed under the previous day: a "today"
+    query at 09:00 read yesterday's row. Local is the right boundary for an estate that reads the
+    table in one timezone.
+
+    Rows written before this change keep the date they were recorded under; they are not rewritten,
+    because converting a historical UsageDate would move spend between days on a guess.
+    """
+    return datetime.now().date()
 
 
 def _now_utc() -> datetime:
@@ -516,22 +524,22 @@ class Store:
         ``FirstSeen`` keeps the earliest and ``LastSeen`` the latest, so a row read later still says
         when the spend happened rather than when it was last touched.
         """
-        day = usage_date or _utc_today()
+        day = usage_date or _local_today()
         update = """
             UPDATE dbo.EODHDUsage
                SET Calls = Calls + ?,
                    Symbols = Symbols + ?,
                    CostTotal = CostTotal + ?,
-                   FirstSeen = CASE WHEN SYSUTCDATETIME() < FirstSeen
-                                    THEN SYSUTCDATETIME() ELSE FirstSeen END,
-                   LastSeen = CASE WHEN SYSUTCDATETIME() > LastSeen
-                                   THEN SYSUTCDATETIME() ELSE LastSeen END
+                   FirstSeen = CASE WHEN SYSDATETIME() < FirstSeen
+                                    THEN SYSDATETIME() ELSE FirstSeen END,
+                   LastSeen = CASE WHEN SYSDATETIME() > LastSeen
+                                   THEN SYSDATETIME() ELSE LastSeen END
              WHERE UsageDate = ? AND Caller = ? AND RequestType = ?
         """
         insert = """
             INSERT INTO dbo.EODHDUsage
                 (UsageDate, Caller, RequestType, Calls, Symbols, CostTotal, FirstSeen, LastSeen)
-            VALUES (?,?,?,?,?,?, SYSUTCDATETIME(), SYSUTCDATETIME())
+            VALUES (?,?,?,?,?,?, SYSDATETIME(), SYSDATETIME())
         """
         params = (int(calls), int(symbols), int(cost), day, caller, request_type)
 
@@ -552,7 +560,7 @@ class Store:
 
     def usage_summary(self, usage_date: Optional[date] = None) -> Dict[str, Any]:
         """The day's spend from the ledger: totals, and the breakdowns that explain them."""
-        day = usage_date or _utc_today()
+        day = usage_date or _local_today()
         conn = self.connect()
         try:
             cursor = conn.cursor()

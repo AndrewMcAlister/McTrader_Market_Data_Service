@@ -380,11 +380,23 @@ vendor at any time:
 apiRequests 2798 / dailyRateLimit 100000
 ```
 
-### The day boundary is UTC
+### The day boundary is local
 
-`UsageDate` is the **UTC** date, matching `SYSUTCDATETIME()` and the rows already in the table. A Sydney
-morning therefore lands on the previous UTC date — correct against a vendor that resets on UTC, but it
-means "today" in the table is not "today" at the desk.
+`UsageDate`, `FirstSeen` and `LastSeen` are **local wall-clock**, matching the logging tables and the
+desk clock.
+
+It was UTC, which filed a Sydney morning's spend under the previous day: a "today" query at 09:00 read
+yesterday's row, and the ledger disagreed with every other clock in the estate.
+
+Two consequences, stated once:
+
+- a date here cannot be compared with a date from another timezone without knowing this one;
+- the vendor's own quota (`/user`) resets on UTC, so the ledger's day and the vendor's day are offset
+  by the number of hours this site is ahead. A reconciliation against `/user` therefore agrees on the
+  total but not on where the midnight boundary falls.
+
+Rows written before this change keep the dates they were recorded under — they are not rewritten,
+because converting a historical `UsageDate` would move spend between days on a guess.
 
 ## The daily job
 
