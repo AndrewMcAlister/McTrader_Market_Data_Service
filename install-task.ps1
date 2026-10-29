@@ -43,7 +43,9 @@ param(
     [switch]$Run,
     [switch]$Restart,
     [switch]$Status,
-    [string]$User
+    [string]$User,
+    #: Local time for the daily refresh. 11:30 is chosen against the US close, not for convenience.
+    [string]$RefreshAt = '11:30'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -52,6 +54,7 @@ $TaskName = 'McTrader_Market_Data_Service_KeepAlive'
 $Port = 8003
 $Root = $PSScriptRoot   # this script lives at the project root
 $Ensure = Join-Path $Root 'scripts\Ensure-MarketDataService.ps1'
+$Refresh = Join-Path $Root 'scripts\Refresh-DailyBars.ps1'
 $PowerShell = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
 $Description = 'Market data for the trading books on port 8003: prices, daily bars and ATR. Runs as the interactive account so the EODHD key in the credential store is readable.'
 
@@ -108,10 +111,11 @@ if ($Remove) {
     }
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
     Write-Host "removed $TaskName"
-    $stopName = "$($TaskName)_Stop"
-    if (Get-ScheduledTask -TaskName $stopName -ErrorAction SilentlyContinue) {
-        Unregister-ScheduledTask -TaskName $stopName -Confirm:$false
-        Write-Host "removed $stopName"
+    foreach ($extra in @("$($TaskName)_Stop", "$($TaskName)_Refresh")) {
+        if (Get-ScheduledTask -TaskName $extra -ErrorAction SilentlyContinue) {
+            Unregister-ScheduledTask -TaskName $extra -Confirm:$false
+            Write-Host "removed $extra"
+        }
     }
     exit 0
 }
@@ -234,8 +238,29 @@ if ($Install) {
         -Description "$Description (stops it; run on demand, no trigger)" `
         -User $credential.UserName -Password $plainPassword | Out-Null
 
+    # A THIRD task: the daily bulk refresh.
+    #
+    # 11:30 local is not a round number chosen for tidiness. The US session closes at 16:00 ET, which
+    # is 07:00 or 08:00 in Sydney depending on the season, and data_service.sessions treats a session
+    # as complete only three hours after its close. A refresh before that margin asks for a session
+    # the service still considers open -- so it either pulls the previous one again (100 units for
+    # nothing) or reports itself behind-expected every day.
+    $RefreshTaskName = "$($TaskName)_Refresh"
+    if (Get-ScheduledTask -TaskName $RefreshTaskName -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $RefreshTaskName -Confirm:$false
+    }
+    $refreshAction = New-ScheduledTaskAction -Execute $PowerShell `
+        -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$Refresh`"" `
+        -WorkingDirectory $Root
+    $refreshTrigger = New-ScheduledTaskTrigger -Daily -At $RefreshAt
+    Register-ScheduledTask -TaskName $RefreshTaskName `
+        -Action $refreshAction -Trigger $refreshTrigger -Settings $settings `
+        -Description "$Description (daily bulk refresh at $RefreshAt local)" `
+        -User $credential.UserName -Password $plainPassword | Out-Null
+
     Write-Host "`nregistered $TaskName" -ForegroundColor Cyan
     Write-Host "registered $StopTaskName (no trigger -- for stop.bat)" -ForegroundColor Cyan
+    Write-Host "registered $RefreshTaskName (daily at $RefreshAt -- POST /refresh)" -ForegroundColor Cyan
     Write-Host "starting it now..."
     Start-ScheduledTask -TaskName $TaskName
     Start-Sleep -Seconds 8

@@ -21,6 +21,7 @@ from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from ..eodhd import EodhdClient, EodhdError, bare_symbol, normalise_venue
+from ..sessions import latest_completed_session
 from .base import (
     COMMODITIES, CRYPTO, FOREX, INDICES, RATES, SHARES,
     ProviderBar, ProviderError, ProviderQuote,
@@ -117,7 +118,7 @@ class EodhdProvider:
         except EodhdError as exc:
             raise ProviderError(exc.reason, exc.detail, exc.status) from exc
 
-        today = datetime.now(timezone.utc).date()
+        latest = latest_completed_session(market)
         out: List[ProviderBar] = []
         for raw in payload:
             text = str(raw.get("date") or "").strip()
@@ -127,7 +128,7 @@ class EodhdProvider:
                 session = date.fromisoformat(text)
             except ValueError:
                 continue
-            if session >= today:
+            if session > latest:
                 continue  # in-progress session: a partial range would shrink a stop
             adjusted = _number(raw.get("adjusted_close"))
             close = adjusted if adjusted is not None else _number(raw.get("close"))

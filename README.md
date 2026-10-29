@@ -398,6 +398,78 @@ Two consequences, stated once:
 Rows written before this change keep the dates they were recorded under — they are not rewritten,
 because converting a historical `UsageDate` would move spend between days on a guess.
 
+## Bulk refresh on demand
+
+`POST /refresh` pulls the whole market's daily bars into `DailySnapshot`. Measured:
+
+| | |
+|---|---|
+| vendor units | **100**, one `/eod-bulk-last-day` call (flat-priced) |
+| duration | **~30 s** with the ATR rebuild (2,866 symbols), **~10 s** pull-only |
+| rows written | ~44,000 for a full session |
+
+That is short enough to be a synchronous HTTP call, and long enough that the service does not do it
+behind a data request.
+
+```powershell
+Invoke-RestMethod -Method Post http://127.0.0.1:8003/refresh -ContentType 'application/json' -Body '{}'
+```
+
+```json
+{"status":"refreshed","newest_session":"2026-10-28","expected_session":"2026-10-28",
+ "behind_expected":false,"rows_written":44026,"units":100,"duration_ms":29791,
+ "sessions":[{"session":"2026-10-28","received":44134,"written":44026}],
+ "indicators":{"symbols_considered":2866,"indicators_written":2866}}
+```
+
+### It checks before it spends
+
+`{"status":"already-fresh","units":0}` comes back in milliseconds when the spend ledger already records
+a bulk pull for today. That check reads `EODHDUsage`, not `MAX(SnapshotDate)` — single-symbol rows
+written by `/bars` carry today's date, so the newest session can be today while the market-wide pull has
+not run for weeks. `force: true` skips the check; so does naming a `session_date`, since a dated
+backfill cannot be vouched for by today's ledger entry.
+
+### Two callers don't double-spend
+
+A non-blocking lock makes the second caller report `409 busy` rather than queue behind the first. Waiting
+30 s for someone else's pull is worse than being told to ask again, and two concurrent pulls would each
+spend 100 units writing the same rows.
+
+### It reports whether it produced the right session
+
+`expected_session` comes from `data_service.sessions` — the venue's own clock, close plus a
+three-hour settlement margin. `behind_expected` is true when the vendor returned an older session than
+the venue says should exist, which is how a vendor lag or a holiday becomes visible instead of silent.
+For scale: at 20:30 Sydney the answer is `US: 2026-10-28`, `AU: 2026-10-29` — the ASX has settled and
+the US has not.
+
+### Why a data request does not trigger it
+
+A single-symbol `/bars` miss costs **1** unit through `/eod/`; triggering the bulk pull from it would
+cost **100** — a hundred times the request that caused it. It would also charge those units to whichever
+client happened to ask first, pile several clients up behind the lock, and hide the failure that
+matters: if the daily refresh did not run, data requests should visibly degrade to per-symbol fetches,
+not quietly repair themselves at 100 units a time.
+
+### The task
+
+`install-task.ps1 -Install` registers a third task, `<task>_Refresh`, running daily at **11:30 local**.
+That time is chosen, not rounded: the US close is 16:00 ET (07:00 or 08:00 in Sydney) and a session
+counts only after the three-hour settlement margin, so anything earlier would ask for a session the
+service still considers open.
+
+By hand:
+
+```cmd
+refresh.bat            :: skips if already fresh
+refresh.bat /force     :: pulls again
+```
+
+History is appended to `logs\refresh-history.txt`, and the task's exit code is 0 for both "refreshed"
+and "already-fresh", 1 for anything else — so `Get-ScheduledTaskInfo` distinguishes nothing-to-do from
+went-wrong.
+
 ## The daily job
 
 ```

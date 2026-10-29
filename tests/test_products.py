@@ -23,6 +23,7 @@ from data_service import config as config_module
 from data_service import products as products_module
 from data_service.products import MarketDataError, Products
 from data_service.providers import EodhdProvider, ProviderRouter
+from data_service.providers import eodhd_provider as eodhd_provider_module
 
 
 def _past_sessions(count: int, start: int = 0):
@@ -35,11 +36,16 @@ class FakeClient:
     """Stands in for EodhdClient. Counts calls so a test can prove none were made."""
 
     def __init__(self, price: float = 100.0, previous: float = 98.0,
-                 bulk_rows: int = 300, bars_per_symbol: int = 40) -> None:
+                 bulk_rows: int = 300, bars_per_symbol: int = 40,
+                 eod_start: int = 1) -> None:
         self.price = price
         self.previous = previous
         self.bulk_rows = bulk_rows
         self.bars_per_symbol = bars_per_symbol
+        # How far behind today the newest bar the vendor has sits. 1 = yesterday's session,
+        # which is what a vendor answers before it publishes the session that just closed.
+        # A test that needs the vendor to have caught up sets this to 0.
+        self.eod_start = eod_start
         self.calls = {"real_time": 0, "real_time_bulk": 0, "eod": 0}
         self.units = 0
 
@@ -65,7 +71,7 @@ class FakeClient:
         self.calls["eod"] += 1
         self.units += 1
         rows = []
-        for index, session in enumerate(_past_sessions(self.bars_per_symbol, start=1)):
+        for index, session in enumerate(_past_sessions(self.bars_per_symbol, start=self.eod_start)):
             base = 100.0 + index
             rows.append({
                 "date": session.isoformat(), "open": base, "high": base + 2.0,
@@ -299,6 +305,109 @@ def test_allow_fetch_false_never_touches_the_vendor():
     assert client.calls["eod"] == 0
     assert result["bars"] == {}
     assert result["short_history"] == ["AAPL"]
+
+
+# ---------------------------------------------------------------------------
+# bars: a cache hit must be current, not merely long enough
+#
+# The defect these pin: the cache test was `len(rows) >= sessions`. Once a symbol held
+# enough history it was served from the cache for ever, because nothing ever asked the
+# vendor again -- so a symbol tracked on the ASX, whose session closes at 16:00 Sydney
+# and whose stored series stopped the day before, stayed a session behind permanently.
+# ---------------------------------------------------------------------------
+
+def _ahead_of_cache(store, symbol: str) -> date:
+    """The session after the newest one the store holds for *symbol*."""
+    newest = max(row["session"] for row in store.daily[symbol].values())
+    return newest + timedelta(days=1)
+
+
+def _pin_session(monkeypatch, session: date) -> None:
+    """Pin the newest completed session everywhere it is asked for.
+
+    Two modules import the rule by name -- the reader decides whether the cache is
+    current, the provider decides whether a vendor row is finished -- so pinning only
+    one leaves the other filtering the very row the test wants to see.
+    """
+    for module in (products_module, eodhd_provider_module):
+        monkeypatch.setattr(module, "latest_completed_session",
+                            lambda market, now=None: session)
+
+
+def test_a_cached_series_that_stops_before_the_completed_session_is_refreshed(monkeypatch):
+    products, client, store = _products()
+    products.bars(["AAPL"], sessions=15)
+    assert client.calls["eod"] == 1
+
+    ahead = _ahead_of_cache(store, "AAPL")
+    _pin_session(monkeypatch, ahead)
+    client.eod_start = 0  # the vendor has since published that session
+
+    result = products.bars(["AAPL"], sessions=15)
+
+    assert client.calls["eod"] == 2
+    assert result["bars"]["AAPL"]["as_of_session"] == ahead.isoformat()
+
+
+def test_a_refresh_that_cannot_reach_the_session_is_asked_for_once(monkeypatch):
+    """A holiday, or a vendor that publishes late, must not cost a call per request."""
+    products, client, _ = _products()
+    _pin_session(monkeypatch, date.today() + timedelta(days=5))
+
+    products.bars(["AAPL"], sessions=15)
+    products.bars(["AAPL"], sessions=15)
+
+    assert client.calls["eod"] == 1
+
+
+def test_a_failed_refresh_is_retried_after_the_window(monkeypatch):
+    """The vendor publishes after the close, so one early miss must not last the session.
+
+    Without this the first caller past the settle window -- often an hour before the
+    vendor has the day -- would keep every later scan on the older series until the
+    next close.
+    """
+    products, client, _ = _products()
+    _pin_session(monkeypatch, date.today() + timedelta(days=5))
+    now = [datetime(2026, 10, 29, 9, 0)]
+    monkeypatch.setattr(products_module, "_utc_naive", lambda: now[0])
+
+    products.bars(["AAPL"], sessions=15)
+    assert client.calls["eod"] == 1
+
+    now[0] += timedelta(seconds=products_module.BARS_REFRESH_TTL_SECONDS / 2)
+    products.bars(["AAPL"], sessions=15)
+    assert client.calls["eod"] == 1          # still inside the window
+
+    now[0] += timedelta(seconds=products_module.BARS_REFRESH_TTL_SECONDS)
+    products.bars(["AAPL"], sessions=15)
+    assert client.calls["eod"] == 2          # the window has passed
+
+
+def test_a_newer_session_asks_the_vendor_again(monkeypatch):
+    """The memory is per session, so the next close is not suppressed by the last one."""
+    products, client, _ = _products()
+    first = date.today() + timedelta(days=5)
+    _pin_session(monkeypatch, first)
+    products.bars(["AAPL"], sessions=15)
+
+    _pin_session(monkeypatch, first + timedelta(days=1))
+    products.bars(["AAPL"], sessions=15)
+
+    assert client.calls["eod"] == 2
+
+
+def test_a_current_cache_still_costs_nothing(monkeypatch):
+    """The inverse: the freshness rule must not turn every read into a vendor call."""
+    products, client, store = _products()
+    products.bars(["AAPL"], sessions=15)
+
+    newest = max(row["session"] for row in store.daily["AAPL"].values())
+    _pin_session(monkeypatch, newest)
+
+    products.bars(["AAPL"], sessions=15)
+
+    assert client.calls["eod"] == 1
 
 
 # ---------------------------------------------------------------------------

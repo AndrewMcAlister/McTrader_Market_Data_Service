@@ -38,6 +38,7 @@ from . import __version__, config as config_module
 from .eodhd import EodhdError
 from .products import MarketDataError, Products
 from .secrets_service import EodhdKeyStore, KeyringUnavailable
+from .refresh import refresh_daily_bars
 from .store import Store, StoreBusy
 from .usage import set_caller
 
@@ -79,6 +80,23 @@ class EodhdKeyRequest(BaseModel):
     """The vendor key, on its way in. Never logged, never echoed back."""
 
     api_key: str = Field(..., min_length=1, description="The EODHD API key")
+
+
+class RefreshRequest(BaseModel):
+    """Ask for a bulk refresh of the daily bars.
+
+    ``force`` exists because the freshness check is deliberately conservative: if a bulk pull is
+    already recorded for today, the endpoint does nothing and says so rather than spending another
+    100 units. A person who wants it anyway says so.
+    """
+
+    market: str = Field("US", description="Market to pull; only US is measured")
+    session_date: Optional[str] = Field(
+        None, description="A specific session (YYYY-MM-DD); default is the latest completed one")
+    force: bool = Field(False, description="Pull again even if one is already recorded today")
+    include_indicators: bool = Field(
+        True, description="Rebuild IndicatorCache afterwards -- a refresh that leaves ATR stale is "
+                          "half a refresh")
 
 
 class BarsRequest(BaseModel):
@@ -339,6 +357,46 @@ def create_app() -> FastAPI:
         threading.Timer(0.4, lambda: os._exit(0)).start()
         return {"ok": True, "stopping": True, "requested_by": caller,
                 "note": "the boot task is boot-only, so nothing restarts this; run start.bat"}
+
+    # -- bulk refresh ------------------------------------------------------
+
+    @app.post("/refresh", tags=["market data"])
+    def post_refresh(request: Request, body: Optional[RefreshRequest] = None) -> Any:
+        """Pull the whole market's daily bars into DailySnapshot, on demand.
+
+        Measured: 100 vendor units and about 30 seconds for a full session (~44,000 rows plus the
+        ATR rebuild for 2,866 symbols); about 10 seconds without the rebuild. The freshness check is
+        free -- it reads the spend ledger -- so calling this when nothing has changed costs nothing
+        and answers in milliseconds.
+
+        Idempotent: the pull upserts by (symbol, session), so running it twice is harmless. Two
+        callers at once do not double-spend, because a non-blocking lock makes the second one report
+        `busy` instead.
+        """
+        denied = _admin_guard(request)
+        if denied is not None:
+            return denied
+
+        products = _products(request)
+        if products is None:
+            return JSONResponse(status_code=503, content={"error": "vendor-unavailable"})
+
+        _attribute(request, "http:/refresh")
+        options = body or RefreshRequest()
+        result = refresh_daily_bars(
+            store=request.app.state.store,
+            client=products.client,
+            settings=request.app.state.settings,
+            market=options.market,
+            session_date=options.session_date,
+            force=options.force,
+            include_indicators=options.include_indicators,
+        )
+        status = result.get("status")
+        code = 202 if status == "refreshed" else 409 if status == "busy" else 200
+        if status == "no-vendor-key":
+            code = 503
+        return JSONResponse(status_code=code, content=result)
 
     # -- the four data endpoints -------------------------------------------
 

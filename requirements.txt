@@ -6,6 +6,10 @@ keyring>=24.0
 requests>=2.31
 pytest>=8.0
 
+# The IANA time-zone database. Windows has none of its own, so zoneinfo reads this package;
+# without it every venue lookup in data_service.sessions raised and /bars answered 500.
+tzdata>=2024.1
+
 # The MCP wrapper (data_service.mcp_server). Pinned below 2 because 2.x renamed FastMCP
 # to MCPServer, and this wrapper mirrors McTrader's own MCP server, which is written against v1.
 mcp<2

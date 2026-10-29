@@ -558,6 +558,25 @@ class Store:
         finally:
             conn.close()
 
+    def bulk_pull_count(self, request_type: str,
+                        usage_date: Optional[date] = None) -> int:
+        """How many calls of *request_type* the ledger records for the day. Free to ask.
+
+        Used as the freshness signal for the bulk refresh. Not MAX(SnapshotDate): single-symbol rows
+        from /bars carry today's date, so the newest session can be today while the market-wide pull
+        has not run.
+        """
+        day = usage_date or _local_today()
+        conn = self.connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT ISNULL(SUM(Calls), 0) FROM dbo.EODHDUsage "
+                "WHERE UsageDate = ? AND RequestType = ?", day, request_type)
+            return int(cursor.fetchone()[0] or 0)
+        finally:
+            conn.close()
+
     def usage_summary(self, usage_date: Optional[date] = None) -> Dict[str, Any]:
         """The day's spend from the ledger: totals, and the breakdowns that explain them."""
         day = usage_date or _local_today()

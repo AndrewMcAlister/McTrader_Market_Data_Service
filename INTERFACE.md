@@ -217,6 +217,41 @@ Completed daily bars.
 
 ---
 
+## 5a. `POST /refresh` — pull the whole market now
+
+```json
+{"market": "US", "session_date": null, "force": false, "include_indicators": true}
+```
+
+| Field | Default | Notes |
+|---|---|---|
+| `market` | `US` | only US is measured |
+| `session_date` | `null` | `YYYY-MM-DD` for a dated backfill; bypasses the freshness check |
+| `force` | `false` | pull even though a bulk pull is already recorded today |
+| `include_indicators` | `true` | rebuild `IndicatorCache` afterwards |
+
+| Status | HTTP | Meaning |
+|---|---|---|
+| `refreshed` | **202** | the pull ran; body carries sessions, rows, units, duration |
+| `already-fresh` | 200 | a bulk pull is recorded today; **spent nothing**, returns in ms |
+| `busy` | 409 | another refresh holds the lock; ask again later |
+| `no-vendor-key` | 503 | no EODHD key configured |
+
+**Cost: 100 units and about 30 seconds.** That is one flat-priced `/eod-bulk-last-day` call, plus the
+ATR rebuild (~2,866 symbols). Pull-only is about 10 seconds.
+
+**It is idempotent** — the pull upserts by (symbol, session), so running it twice is harmless — and it
+**does not double-spend**: a non-blocking lock makes the second concurrent caller `409 busy`.
+
+`expected_session` and `behind_expected` are the useful fields for monitoring. `expected_session` is
+what `data_service.sessions` says the venue's clock allows; `behind_expected: true` means the vendor
+returned an older session, i.e. lag or a holiday — visible rather than silent.
+
+**Send `X-MarketData-Caller`.** The 100 units land in the spend ledger against it, which is the only
+way to tell an automatic refresh from a manual one later.
+
+---
+
 ## 5. Operations
 
 | Endpoint | Purpose |

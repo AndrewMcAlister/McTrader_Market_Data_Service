@@ -34,7 +34,7 @@ from __future__ import annotations
 import logging
 import threading
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from . import atr as atr_module
 from . import config as config_module
@@ -42,6 +42,7 @@ from .eodhd import EodhdClient, EodhdError, bare_symbol, normalise_venue
 from .providers import (
     ProviderError, build_router, normalise_asset_class,
 )
+from .sessions import latest_completed_session, market_code
 from .store import Store
 from .usage import Tariff, UsageLedger
 
@@ -85,25 +86,21 @@ def _epoch_to_utc(value: Any) -> Optional[datetime]:
         return None
 
 
+#: How long a refresh that could not reach the newest session is trusted before it is
+#: tried again.  A vendor publishes a session some time after it closes, so the first
+#: caller past the settle window often finds nothing new; without a retry that one early
+#: answer would hold every later caller in the same session back until the next close.
+#: An hour bounds the cost of a day the venue does not trade -- one call per symbol per
+#: hour -- while still catching the publication an hour after it happens.
+BARS_REFRESH_TTL_SECONDS = 3600.0
+
+
 def _number(value: Any) -> Optional[float]:
     try:
         out = float(value)
     except (TypeError, ValueError):
         return None
     return out if out == out and abs(out) != float("inf") else None
-
-
-def _us_session_date(now: Optional[datetime] = None) -> date:
-    """Today's US session date, as a rough UTC-date proxy.
-
-    Deliberately conservative for one purpose only: refusing to serve a bar for the session
-    still in progress. A partial session has a partial range, and using it would shrink a
-    stop exactly when the morning is quiet.
-    """
-    now = now or _utc_naive()
-    # 09:30-16:00 ET is 13:30-21:00 UTC in both DST and standard time, so a UTC date is
-    # never more than a few hours ahead of the session date. Treat ">= today" as in progress.
-    return now.date()
 
 
 class Products:
@@ -154,6 +151,11 @@ class Products:
         self._bulk_fetched_at: Optional[datetime] = None
         self._bulk_rows_seen = 0
         self._bulk_rows_dropped = 0
+        # (market, symbol) -> (the session a refresh was asked for, when it was asked).
+        # A cached series that does not yet reach the newest completed session is refreshed,
+        # and remembering the attempt keeps that to one call per symbol per retry window
+        # rather than one per caller -- see BARS_REFRESH_TTL_SECONDS.
+        self._bars_refreshed: Dict[Tuple[str, str], Tuple[date, datetime]] = {}
         self.counters: Dict[str, int] = {
             "price_from_cache": 0, "price_from_vendor": 0,
             "bars_from_cache": 0, "bars_from_vendor": 0,
@@ -397,6 +399,14 @@ class Products:
 
         ``sessions`` is floored at ``min_sessions`` for ATR purposes elsewhere, but this
         call returns what was asked for: a caller inspecting 5 sessions is not an error.
+
+        A cache hit requires the series to reach the newest *completed* session, not merely
+        to hold enough rows. Counting rows was the whole test, so a symbol whose stored
+        series was one session behind was served from the cache forever -- nothing asked
+        the vendor again, and an instrument traded on the ASX sat a session stale while the
+        venue's own clock said the day was over. The refresh it triggers is remembered by
+        the session it was asked for, so a holiday costs one call per symbol, not one per
+        request. The answer's ``as_of_session`` states which session was actually served.
         """
         kind = normalise_asset_class(asset_class)
         market = "CRYPTO" if kind == "crypto" else normalise_venue(venue)
@@ -410,7 +420,7 @@ class Products:
         if sessions < 1:
             raise MarketDataError("bad-sessions", "sessions must be at least 1")
 
-        today = _us_session_date()
+        latest = latest_completed_session(market)
         banked = self.store.get_daily_bars_many(wanted, sessions)
 
         out: Dict[str, Any] = {}
@@ -418,20 +428,29 @@ class Products:
         short: List[str] = []
 
         for symbol in wanted:
-            rows = [r for r in banked.get(symbol, []) if r["session"] < today]
-            if len(rows) >= sessions:
+            rows = [r for r in banked.get(symbol, []) if r["session"] <= latest]
+            current = bool(rows) and rows[-1]["session"] >= latest
+            if len(rows) >= sessions and current:
                 self.counters["bars_from_cache"] += 1
                 out[symbol] = self._bars_payload(symbol, rows[-sessions:], "cache", market)
                 continue
 
-            if not allow_fetch:
-                short.append(symbol)
+            keep = (market, symbol)
+            asked = self._bars_refreshed.get(keep)
+            if not allow_fetch or (
+                asked is not None
+                and asked[0] == latest
+                and (_utc_naive() - asked[1]).total_seconds() < BARS_REFRESH_TTL_SECONDS
+            ):
+                if len(rows) < sessions:
+                    short.append(symbol)
                 if rows:
                     out[symbol] = self._bars_payload(symbol, rows, "cache", market)
                 continue
 
             # Enough sessions to answer, and one vendor call whatever the window.
             need = max(sessions, self.settings.min_sessions)
+            self._bars_refreshed[keep] = (latest, _utc_naive())
             try:
                 provider_rows, provider_name = self.router.bars(
                     symbol, kind, sessions=need, venue=market)
@@ -448,7 +467,7 @@ class Products:
             fresh_rows = self._write_provider_bars(symbol, provider_rows, provider_name)
             fetched.append(symbol)
             self.counters["bars_from_vendor"] += 1
-            fresh_rows = [r for r in fresh_rows if r["session"] < today]
+            fresh_rows = [r for r in fresh_rows if r["session"] <= latest]
             if fresh_rows:
                 out[symbol] = self._bars_payload(
                     symbol, fresh_rows[-sessions:], "vendor", market, provider_name)
@@ -568,7 +587,7 @@ class Products:
             raise MarketDataError("no-symbols", "supply at least one symbol")
 
         cached = self.store.get_indicators(wanted) if cache_eligible else {}
-        today = _us_session_date()
+        latest = latest_completed_session(market_code(venue, asset_class))
 
         results: Dict[str, Any] = {}
         to_compute: List[str] = []
@@ -579,7 +598,7 @@ class Products:
                 and hit.get("method") == method
                 and hit.get("smoothing") == smoothing
                 and hit.get("as_of_session") is not None
-                and hit["as_of_session"] < today
+                and hit["as_of_session"] <= latest
                 and (hit.get("values") or {}).get(period) is not None
             ):
                 value = hit["values"][period]
