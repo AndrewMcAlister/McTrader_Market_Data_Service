@@ -1,7 +1,7 @@
 """The store: three tables, and the queries the products need.
 
 Nothing in this module names a database. It takes a connection string, so the
-``Back_Test`` -> ``Market_Data`` rename is a configuration change (``MDS_DATABASE``) rather
+The ``Back_Test`` -> ``Market_Data`` rename was a configuration change (``MDS_DATABASE``) rather
 than a migration.
 
 Upserts use ``MERGE`` rather than update-then-insert because the daily job writes ~2,800

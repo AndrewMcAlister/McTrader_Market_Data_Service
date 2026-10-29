@@ -3,7 +3,7 @@
 Everything here is overridable by environment variable, because the two things most likely
 to change are the ones that must not require a code edit:
 
-* the **database** -- `Back_Test` is being renamed to `Market_Data`, so `MDS_DATABASE`
+* the **database** -- `Market_Data` (renamed from `Back_Test` on 2026-10-29), so `MDS_DATABASE`
   decides which it connects to. Nothing in the code or the SQL names a database, so the
   rename is a config change and not a migration.
 * the **EODHD key** -- taken from the OS keyring by default, the same entry McTrader and
@@ -85,7 +85,7 @@ class Settings:
 
     # -- database ----------------------------------------------------------
     db_server: str = "localhost"
-    db_database: str = "Back_Test"
+    db_database: str = "Market_Data"
     db_driver: str = "ODBC Driver 17 for SQL Server"
     db_trusted: bool = True
     db_trust_server_certificate: bool = True
@@ -177,7 +177,7 @@ def load(api_key: Optional[str] = None) -> Settings:
         eodhd_timeout_seconds=_env_float("MDS_EODHD_TIMEOUT", 30.0),
         eodhd_bulk_timeout_seconds=_env_float("MDS_EODHD_BULK_TIMEOUT", 60.0),
         db_server=_env("MDS_DB_SERVER", "localhost"),
-        db_database=_env("MDS_DATABASE", "Back_Test"),
+        db_database=_env("MDS_DATABASE", "Market_Data"),
         db_driver=_env("MDS_DB_DRIVER", "ODBC Driver 17 for SQL Server"),
         db_trusted=_env("MDS_DB_TRUSTED", "1") not in ("0", "false", "False"),
         db_trust_server_certificate=_env("MDS_DB_TRUST_CERT", "1") not in ("0", "false", "False"),

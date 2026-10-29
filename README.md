@@ -426,20 +426,29 @@ read it as one enormous move. `--since` exists to close one.
 
 ---
 
-## The `Back_Test` → `Market_Data` rename
+## The `Back_Test` → `Market_Data` rename (done 2026-10-29)
 
-`Back_Test` is being renamed `Market_Data`, and the rename is the point: this database stops
-being only a backtest warehouse and becomes the market data source of record.
+`Back_Test` became `Market_Data`. The rename was the point: this database stops being only a
+backtest warehouse and becomes the market data source of record.
 
-Nothing here needs to change when it happens:
+It was a configuration change, as designed — the schema script names no database, the store takes a
+connection string, and `/healthz` and `/stats` report which database is in use. What it needed,
+in this order:
 
-```powershell
-$env:MDS_DATABASE = 'Market_Data'
-```
+1. stop whichever process holds connections;
+2. rename the database;
+3. point every consumer at the new name.
 
-The schema script names no database, the store takes a connection string, and
-`/stats` reports which database it is talking to. The only thing to do at rename time is stop
-the service, rename the database, and point `MDS_DATABASE` at the new name.
+**Step 3 is the one that bites**, and it caught the running service: after the rename it reported
+`degraded` with `database_ok=false` and `/stats` returned 500, because its default was still
+`Back_Test`. The default here is now `Market_Data`.
+
+**PaperTrader also read this database** — `sql_store.py` defaulted to `BACKTEST_DB=Back_Test`, and
+three of its analysis scripts named it in SQL. Those were updated in the same pass; anything that still
+holds a connection or an old default needs a restart to pick the new name up.
+
+Verified after the rename: `SymbolPriceCache`, `IndicatorCache`, `DailySnapshot`, `EODHDUsage` (237
+rows), `RequestTypes` (11) and the 13.4M-row `BarHourly` all arrived intact.
 
 ---
 
@@ -449,7 +458,7 @@ All by environment variable; defaults are the safe ones.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MDS_DATABASE` | `Back_Test` | target database (becomes `Market_Data`) |
+| `MDS_DATABASE` | `Market_Data` | target database (renamed from `Back_Test` on 2026-10-29) |
 | `MDS_DB_SERVER` | `localhost` | SQL Server |
 | `MDS_PRICE_TTL_SECONDS` | `300` | price cache lifetime |
 | `MDS_BULK_BREAKEVEN` | `100` | symbols at which bulk beats per-symbol |

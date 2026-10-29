@@ -11,7 +11,7 @@
     obscurely.
 
     The service runs as LocalSystem (NT AUTHORITY\SYSTEM) by default. That identity has been
-    granted db_datareader + db_datawriter + db_ddladmin on `Back_Test`, so no password is stored
+    granted db_datareader + db_datawriter + db_ddladmin on `Market_Data`, so no password is stored
     anywhere -- db_ddladmin because the app creates its three tables on startup if they are
     absent. Use -AsUser to run as an interactive account instead.
 
