@@ -30,7 +30,7 @@
 param(
     [int]$Port = 8003,
     [int]$WaitSeconds = 45,
-    [int]$MaxStartsPerHour = 6,
+    [int]$MaxStartsPerHour = 30,
     [switch]$Stop,
     [switch]$Restart
 )
@@ -77,6 +77,19 @@ function Get-RecentStarts {
 
 Note "ensure: port=$Port pid=$PID"
 
+# Checked BEFORE anything is stopped, so a refusal leaves a running service alone.
+#
+# This ordering is not cosmetic. On 2026-10-29 the check came after the stop: the launcher killed the
+# service, then refused to start a replacement because the hourly cap was reached, and exited 1. A
+# safety feature left the service dead. A refusal must be inert.
+$recent = Get-RecentStarts
+if (-not $Stop -and $recent -ge $MaxStartsPerHour) {
+    Note ("REFUSED: $recent start(s) in the last hour (cap $MaxStartsPerHour). " +
+          "Something is crashing on startup -- read the service log, then re-run. " +
+          "NOTHING WAS STOPPED: the running service is untouched.")
+    exit 1
+}
+
 # Stop whatever holds the port before starting, unconditionally.
 #
 # This is McTrader's Stop-StaleListener, and it is what makes a bare run of this script a
@@ -113,13 +126,6 @@ Note "ensure: port=$Port pid=$PID"
 # Already up: nothing to do. This is the common case and must stay silent in the history.
 if (-not (Test-Path $Python)) {
     Note "FAILED: no interpreter at $Python"
-    exit 1
-}
-
-$recent = Get-RecentStarts
-if ($recent -ge $MaxStartsPerHour) {
-    Note ("REFUSED: $recent start(s) in the last hour (cap $MaxStartsPerHour). " +
-          "Something is crashing on startup -- read the service log, then re-run.")
     exit 1
 }
 

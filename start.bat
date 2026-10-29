@@ -4,41 +4,50 @@ REM ============================================================================
 REM  Start (or restart) McTrader_Market_Data_Service on port 8003.
 REM ============================================================================
 REM
-REM  This is the same call the scheduled task makes, so running it by hand
-REM  exercises the real path rather than a parallel one.
+REM  This does not touch the process directly. It asks Task Scheduler to run the
+REM  launcher, because the service lives in SESSION 0 (that is where Task
+REM  Scheduler starts it) and a process in your interactive session cannot
+REM  terminate it -- "Access is denied", at any run level. Running the launcher
+REM  from inside the task puts it back in session 0, where the kill succeeds.
 REM
-REM  The launcher stops whatever holds port 8003 and then starts it again. That
-REM  is deliberate: it is what makes a plain run a RESTART, so the code on disk
-REM  is picked up every time without a separate stop step.
+REM  Starting a task that holds a stored password needs no elevation, so this is
+REM  a plain double-click.
 REM
-REM  The EODHD key comes from the per-user Windows credential store, which is why
-REM  this runs as you rather than as a service account. The whole point of the
-REM  account choice is that a LocalSystem process has its own empty vault.
+REM  The EODHD key is read from your per-user credential store, which is why the
+REM  task runs as you rather than as a service account: LOCAL SYSTEM has its own,
+REM  empty vault.
 REM
-REM  It should not need elevation. The task is registered at the default run
-REM  level; if it was ever re-registered with -RunLevel Highest, the service
-REM  runs with an elevated token and only an elevated prompt can stop it.
-REM
-REM  Pauses at the end so a double-click gives you time to read the result.
-REM  For scripted use, call scripts\Ensure-MarketDataService.ps1 directly.
+REM  For scripted use, call: schtasks /run /tn "McTrader_Market_Data_Service_KeepAlive"
 REM ============================================================================
 
-echo.
-echo   Starting McTrader_Market_Data_Service on port 8003...
-echo.
-
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\Ensure-MarketDataService.ps1"
-set RC=%ERRORLEVEL%
+set TASK=McTrader_Market_Data_Service_KeepAlive
+set PORT=8003
 
 echo.
-if "%RC%"=="0" (
-    echo   Started.  Check: http://127.0.0.1:8003/healthz  ^(key_source should be keyring^)
-    echo   Log:             %~dp0logs\data_service.log
-) else (
-    echo   Failed with exit code %RC%.
-    echo   Launcher log:    %~dp0logs\ensure-history.txt
-    echo   Service log:     %~dp0logs\data_service.log
+echo   Starting McTrader_Market_Data_Service...
+echo.
+
+schtasks /run /tn "%TASK%" >nul 2>&1
+if errorlevel 1 (
+    echo   Could not start the scheduled task "%TASK%".
+    echo   It may not be registered. From an elevated prompt:
+    echo       .\install-task.ps1 -Install
+    echo.
+    pause
+    endlocal & exit /b 1
 )
+
+REM ping, not timeout: timeout refuses to run without a console
+ping -n 9 127.0.0.1 >nul
+
+echo   What the launcher did:
+powershell -NoProfile -Command "Get-Content '%~dp0logs\ensure-history.txt' -Tail 5 | ForEach-Object { '     ' + $_ }" 2>nul
+
+echo.
+powershell -NoProfile -Command "try { $h = Invoke-RestMethod 'http://127.0.0.1:%PORT%/healthz' -TimeoutSec 10; Write-Host ('   healthz: ' + $h.status + '   db=' + $h.database + '   key=' + $h.key_source) } catch { Write-Host '   healthz: NOT ANSWERING -- see the service log below' }"
+
+echo.
+echo   Service log: %~dp0logs\data_service.log
 echo.
 pause
-endlocal & exit /b %RC%
+endlocal & exit /b 0

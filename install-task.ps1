@@ -108,6 +108,11 @@ if ($Remove) {
     }
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
     Write-Host "removed $TaskName"
+    $stopName = "$($TaskName)_Stop"
+    if (Get-ScheduledTask -TaskName $stopName -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $stopName -Confirm:$false
+        Write-Host "removed $stopName"
+    }
     exit 0
 }
 
@@ -209,7 +214,28 @@ if ($Install) {
         -Description $Description `
         -User $credential.UserName -Password $plainPassword | Out-Null
 
+    # A SECOND task, with no trigger, whose only job is to stop the service.
+    #
+    # It exists because the service runs in session 0 (Task Scheduler started it) and an interactive
+    # shell in session 2 cannot terminate it -- "Access is denied", at any run level. Running the
+    # launcher from inside a task puts it back in session 0, where the kill succeeds.
+    #
+    # Starting a task registered with a stored password needs no elevation, so stop.bat is a plain
+    # schtasks call.
+    $StopTaskName = "$($TaskName)_Stop"
+    if (Get-ScheduledTask -TaskName $StopTaskName -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $StopTaskName -Confirm:$false
+    }
+    $stopAction = New-ScheduledTaskAction -Execute $PowerShell `
+        -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$Ensure`" -Stop" `
+        -WorkingDirectory $Root
+    Register-ScheduledTask -TaskName $StopTaskName `
+        -Action $stopAction -Settings $settings `
+        -Description "$Description (stops it; run on demand, no trigger)" `
+        -User $credential.UserName -Password $plainPassword | Out-Null
+
     Write-Host "`nregistered $TaskName" -ForegroundColor Cyan
+    Write-Host "registered $StopTaskName (no trigger -- for stop.bat)" -ForegroundColor Cyan
     Write-Host "starting it now..."
     Start-ScheduledTask -TaskName $TaskName
     Start-Sleep -Seconds 8
