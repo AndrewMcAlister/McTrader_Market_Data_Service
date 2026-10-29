@@ -1,0 +1,18 @@
+# Line endings, stated rather than inherited from whoever's core.autocrlf is set.
+# The worktree here was written by a mixture of tools, so some files are LF and some CRLF; without
+# this, the next checkout rewrites half of them and the first commit looks like it touched everything.
+* text=auto
+
+*.py    text eol=lf
+*.md    text eol=lf
+*.sql   text eol=lf
+*.txt   text eol=lf
+*.json  text eol=lf
+
+# PowerShell and cmd files are executed by Windows tooling that expects CRLF.
+*.ps1   text eol=crlf
+*.psm1  text eol=crlf
+*.cmd   text eol=crlf
+
+*.png   binary
+*.jpg   binary

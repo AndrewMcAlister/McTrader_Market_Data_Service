@@ -1,0 +1,34 @@
+# Virtual environment: 88 MB, machine-specific, and its Scripts\*.exe shims embed absolute paths,
+# so it is worthless on any other machine and actively misleading after a folder rename.
+.venv/
+
+# Runtime output. The service writes here; none of it is source.
+logs/
+data/
+
+# Manual pre-edit snapshots (*.before_providers and friends). History belongs in git, not in
+# parallel copies of the file next to it.
+backups/
+*.before_*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Test and tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# A stray PowerShell error transcript from an earlier failed command; not source.
+2026-10-14
+
+# Local settings and secrets. The EODHD key lives in the Windows keyring, never in a file -- this
+# entry is for the day someone adds an override.
+.env
+.env.*
+*.local
+secrets.json
