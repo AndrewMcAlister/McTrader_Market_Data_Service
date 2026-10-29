@@ -93,7 +93,8 @@ Note "ensure: port=$Port pid=$PID"
             Stop-Process -Id $processId -Force -ErrorAction Stop
         } catch {
             Note ("FAILED to stop pid $processId : " + $_.Exception.Message)
-            Note ("It runs at RunLevel Highest, so stopping it needs an elevated prompt.")
+            Note ("If the task was registered with -RunLevel Highest, stopping it needs an " +
+                      "elevated prompt; otherwise re-run this.") 
             exit 1
         }
     }

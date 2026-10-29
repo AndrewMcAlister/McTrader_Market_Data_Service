@@ -127,7 +127,7 @@ if ($Restart) {
         } catch {
             Write-Host ""
             Write-Host "could not stop pid $processId : $($_.Exception.Message)" -ForegroundColor Yellow
-            Write-Host "It runs at runlevel Highest, so an unelevated shell cannot terminate it." -ForegroundColor Yellow
+            Write-Host "If the task was registered with -RunLevel Highest, stopping it needs elevation." -ForegroundColor Yellow
             Write-Host "Re-run this from an elevated prompt:" -ForegroundColor Yellow
             Write-Host "    .\install-task.ps1 -Restart" -ForegroundColor Cyan
             exit 1
@@ -195,10 +195,19 @@ if ($Install) {
         -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
         -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
 
+    # NO -RunLevel Highest, deliberately.
+    #
+    # This account is in the Administrators group, so `-RunLevel Highest` runs the task with the
+    # ELEVATED token while an ordinary shell is UAC-filtered. A medium-integrity shell then cannot
+    # stop the service -- "Access is denied" -- so every restart would need an elevated prompt.
+    #
+    # Nothing here needs elevation: the database uses a login grant, the keyring is per USER (which is
+    # why the task runs as you rather than as LOCAL SYSTEM), the ports are above 1024, and the logs
+    # are in folders you own. Omitting -RunLevel leaves the default, limited run level.
     Register-ScheduledTask -TaskName $TaskName `
         -Action $action -Trigger $boot -Settings $settings `
         -Description $Description `
-        -User $credential.UserName -Password $plainPassword -RunLevel Highest | Out-Null
+        -User $credential.UserName -Password $plainPassword | Out-Null
 
     Write-Host "`nregistered $TaskName" -ForegroundColor Cyan
     Write-Host "starting it now..."
