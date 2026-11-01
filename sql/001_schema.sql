@@ -94,6 +94,7 @@ IF OBJECT_ID('dbo.DailySnapshot', 'U') IS NULL
 BEGIN
     CREATE TABLE dbo.DailySnapshot (
         SymbolCode   varchar(24)   NOT NULL,
+        Exchange     varchar(8)    NOT NULL CONSTRAINT DF_DailySnapshot_Exchange DEFAULT ('US'),
         SnapshotDate date          NOT NULL,
         [Open]       decimal(18,6) NOT NULL,
         [High]       decimal(18,6) NOT NULL,
@@ -103,7 +104,7 @@ BEGIN
         Source       varchar(16)   NOT NULL CONSTRAINT DF_DailySnapshot_Source DEFAULT ('eod-bulk'),
         IsAdjusted   bit           NOT NULL CONSTRAINT DF_DailySnapshot_IsAdjusted DEFAULT (1),
         LoadedUtc    datetime2     NOT NULL CONSTRAINT DF_DailySnapshot_LoadedUtc DEFAULT (SYSUTCDATETIME()),
-        CONSTRAINT PK_DailySnapshot PRIMARY KEY CLUSTERED (SymbolCode, SnapshotDate)
+        CONSTRAINT PK_DailySnapshot PRIMARY KEY CLUSTERED (SymbolCode, Exchange, SnapshotDate)
     );
 
     /* A dated whole-market read (the backfill, and the "who moved today" query) scans by
@@ -120,6 +121,7 @@ IF OBJECT_ID('dbo.IndicatorCache', 'U') IS NULL
 BEGIN
     CREATE TABLE dbo.IndicatorCache (
         SymbolCode     varchar(24)   NOT NULL,
+        Exchange       varchar(8)    NOT NULL CONSTRAINT DF_IndicatorCache_Exchange DEFAULT ('US'),
         Atr14          decimal(18,6) NULL,
         Atr20          decimal(18,6) NULL,
         Atr22          decimal(18,6) NULL,
@@ -131,7 +133,7 @@ BEGIN
         Method         varchar(12)   NOT NULL CONSTRAINT DF_IndicatorCache_Method DEFAULT ('tr'),
         Smoothing      varchar(12)   NOT NULL CONSTRAINT DF_IndicatorCache_Smoothing DEFAULT ('simple'),
         UpdatedUtc     datetime2     NOT NULL CONSTRAINT DF_IndicatorCache_UpdatedUtc DEFAULT (SYSUTCDATETIME()),
-        CONSTRAINT PK_IndicatorCache PRIMARY KEY CLUSTERED (SymbolCode)
+        CONSTRAINT PK_IndicatorCache PRIMARY KEY CLUSTERED (SymbolCode, Exchange)
     );
 END
 GO
@@ -275,4 +277,56 @@ SELECT
         AS LastUpdatedOffsetMinutes,
     Source
 FROM dbo.SymbolPriceCache
+GO
+
+/* ------------------------------------------------------------------ */
+/* 5. Exchange on the bar tables (2026-11-01)                          */
+/* ------------------------------------------------------------------ */
+/* A bare ticker is not unique: the same code can be an ASX listing and a US one, and with
+   a symbol-only key the two overwrite each other -- the US pull silently replacing the AU
+   row for the same date. Both tables are keyed with the venue from here on.
+
+   Guarded three times over: the column is added only when absent, the primary key is
+   rebuilt only when it does not already include Exchange, and the backfill moves a row
+   only when the price cache knows that symbol as AU and knows it as nothing else. A symbol
+   known on both venues is left as US rather than guessed at. */
+
+IF COL_LENGTH('dbo.DailySnapshot', 'Exchange') IS NULL
+    ALTER TABLE dbo.DailySnapshot ADD Exchange varchar(8) NOT NULL
+        CONSTRAINT DF_DailySnapshot_Exchange DEFAULT ('US');
+GO
+
+IF (SELECT COUNT(*) FROM sys.index_columns ic
+      JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+     WHERE i.name = 'PK_DailySnapshot') = 2
+BEGIN
+    ALTER TABLE dbo.DailySnapshot DROP CONSTRAINT PK_DailySnapshot;
+    ALTER TABLE dbo.DailySnapshot ADD CONSTRAINT PK_DailySnapshot
+        PRIMARY KEY CLUSTERED (SymbolCode, Exchange, SnapshotDate);
+END
+GO
+
+IF COL_LENGTH('dbo.IndicatorCache', 'Exchange') IS NULL
+    ALTER TABLE dbo.IndicatorCache ADD Exchange varchar(8) NOT NULL
+        CONSTRAINT DF_IndicatorCache_Exchange DEFAULT ('US');
+GO
+
+IF (SELECT COUNT(*) FROM sys.index_columns ic
+      JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+     WHERE i.name = 'PK_IndicatorCache') = 1
+BEGIN
+    ALTER TABLE dbo.IndicatorCache DROP CONSTRAINT PK_IndicatorCache;
+    ALTER TABLE dbo.IndicatorCache ADD CONSTRAINT PK_IndicatorCache
+        PRIMARY KEY CLUSTERED (SymbolCode, Exchange);
+END
+GO
+
+UPDATE d
+   SET Exchange = 'AU'
+  FROM dbo.DailySnapshot d
+ WHERE d.Exchange = 'US'
+   AND EXISTS (SELECT 1 FROM dbo.SymbolPriceCache p
+                WHERE p.SymbolCode = d.SymbolCode AND p.Venue = 'AU')
+   AND NOT EXISTS (SELECT 1 FROM dbo.SymbolPriceCache p
+                    WHERE p.SymbolCode = d.SymbolCode AND p.Venue = 'US');
 GO

@@ -1,4 +1,4 @@
-"""The products layer: routing, caching and provenance, with no vendor and no database.
+﻿"""The products layer: routing, caching and provenance, with no vendor and no database.
 
 The two decisions most worth pinning are:
 
@@ -112,7 +112,7 @@ class FakeStore:
         return len(rows)
 
     # daily bars
-    def get_daily_bars_many(self, symbols, sessions):
+    def get_daily_bars_many(self, symbols, sessions, exchange="US"):
         out = {}
         for raw in symbols:
             symbol = raw.strip().upper()
@@ -129,7 +129,7 @@ class FakeStore:
         self.daily_writes += len(rows)
         return len(rows)
 
-    def get_indicators(self, symbols):
+    def get_indicators(self, symbols, exchange="US"):
         out = {}
         for raw in symbols:
             symbol = raw.strip().upper()
@@ -475,3 +475,4 @@ def test_the_response_always_states_the_definition_it_used():
     assert result["period"] == 22
     assert result["method"] == "high_low"
     assert result["smoothing"] == "simple"
+

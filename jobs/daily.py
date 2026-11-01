@@ -50,7 +50,8 @@ log = logging.getLogger("data_service.daily")
 # ---------------------------------------------------------------------------
 
 def _row_from_bulk(raw: Dict[str, Any], session_date: date,
-                   symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
+                   symbol: Optional[str] = None,
+                   market: str = "US") -> Optional[Dict[str, Any]]:
     """One bulk row as a DailySnapshot row, preferring adjusted_close."""
     code = symbol or bare_symbol(str(raw.get("code") or ""))
     if not code:
@@ -68,6 +69,7 @@ def _row_from_bulk(raw: Dict[str, Any], session_date: date,
 
     return {
         "symbol": code,
+        "exchange": str(market or "US").strip().upper(),
         "session": session_date,
         "open": open_,
         "high": high,
@@ -236,20 +238,34 @@ def rebuild_indicators(store: Store, settings: config_module.Settings,
     try:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT SymbolCode, COUNT(*) AS n
+            SELECT SymbolCode, Exchange, COUNT(*) AS n
             FROM dbo.DailySnapshot
-            GROUP BY SymbolCode
+            GROUP BY SymbolCode, Exchange
             HAVING COUNT(*) >= ?
         """, need)
-        symbols = [str(r[0]).strip().upper() for r in cursor.fetchall()]
+        symbols = [(str(r[0]).strip().upper(), str(r[1]).strip().upper())
+                   for r in cursor.fetchall()]
     finally:
         conn.close()
 
     log.info("%d symbol(s) have >= %d sessions for ATR(%d)", len(symbols), need, max(periods))
     written = 0
+    # Per venue: a series must not mix an ASX bar with a US one, and the same ticker
+    # can exist on both. Batching stays one query per chunk of symbols.
+    for exchange in sorted({venue for _, venue in symbols}):
+        venue_symbols = [symbol for symbol, venue in symbols if venue == exchange]
+        written += _rebuild_for(store, settings, venue_symbols, exchange,
+                                periods, need, chunk)
+    log.info("IndicatorCache rebuilt for %d symbol(s)", written)
+    return {"symbols_considered": len(symbols), "indicators_written": written}
+
+
+def _rebuild_for(store: Store, settings: config_module.Settings, symbols: List[str],
+                 exchange: str, periods: List[int], need: int, chunk: int) -> int:
+    written = 0
     for start in range(0, len(symbols), chunk):
         batch = symbols[start:start + chunk]
-        bars_by_symbol = store.get_daily_bars_many(batch, max(periods) + 1)
+        bars_by_symbol = store.get_daily_bars_many(batch, max(periods) + 1, exchange)
         rows: List[Dict[str, Any]] = []
         for symbol, bars in bars_by_symbol.items():
             if len(bars) < need:
@@ -267,6 +283,8 @@ def rebuild_indicators(store: Store, settings: config_module.Settings,
                 continue
             rows.append({
                 "symbol": symbol,
+                "symbol": symbol,
+                "exchange": exchange,
                 "values": values,
                 "reference_price": reference,
                 "sessions_used": len(bars),
@@ -276,8 +294,7 @@ def rebuild_indicators(store: Store, settings: config_module.Settings,
             })
         if rows:
             written += store.upsert_indicators(rows)
-    log.info("IndicatorCache rebuilt for %d symbol(s)", written)
-    return {"symbols_considered": len(symbols), "indicators_written": written}
+    return written
 
 
 # ---------------------------------------------------------------------------

@@ -35,7 +35,8 @@ WHEN MATCHED THEN UPDATE SET
     [Close] = source.[Close], Volume = source.Volume, Source = source.Source,
     IsAdjusted = source.IsAdjusted, LoadedUtc = SYSUTCDATETIME()
 WHEN NOT MATCHED THEN INSERT
-    (SymbolCode, SnapshotDate, [Open], [High], [Low], [Close], Volume, Source, IsAdjusted)
+    (SymbolCode, Exchange, SnapshotDate, [Open], [High], [Low], [Close], Volume, Source,
+     IsAdjusted)
 VALUES
     (source.SymbolCode, source.SnapshotDate, source.[Open], source.[High], source.[Low],
      source.[Close], source.Volume, source.Source, source.IsAdjusted);
@@ -54,6 +55,16 @@ CREATE TABLE #stage (
     IsAdjusted   bit           NOT NULL
 );
 """
+
+def _exchange_key(value: Any) -> str:
+    """Normalise a venue to the Exchange column's value: an upper-case market code.
+
+    Defaults to US, which is what every row written before 2026-11-01 actually was and
+    what a caller that says nothing about its venue means.
+    """
+    text = str(value or "").strip().upper()
+    return text or "US"
+
 
 _MERGE_PRICE = """
 MERGE dbo.SymbolPriceCache AS target
@@ -77,9 +88,11 @@ VALUES
 
 _MERGE_DAILY = """
 MERGE dbo.DailySnapshot AS target
-USING (SELECT ? AS SymbolCode, ? AS SnapshotDate, ? AS [Open], ? AS [High], ? AS [Low],
-              ? AS [Close], ? AS Volume, ? AS Source, ? AS IsAdjusted) AS source
-    ON target.SymbolCode = source.SymbolCode AND target.SnapshotDate = source.SnapshotDate
+USING (SELECT ? AS SymbolCode, ? AS Exchange, ? AS SnapshotDate, ? AS [Open], ? AS [High],
+              ? AS [Low], ? AS [Close], ? AS Volume, ? AS Source, ? AS IsAdjusted) AS source
+    ON target.SymbolCode = source.SymbolCode
+   AND target.Exchange = source.Exchange
+   AND target.SnapshotDate = source.SnapshotDate
 WHEN MATCHED THEN UPDATE SET
     [Open] = source.[Open], [High] = source.[High], [Low] = source.[Low],
     [Close] = source.[Close], Volume = source.Volume, Source = source.Source,
@@ -93,17 +106,17 @@ VALUES
 
 _MERGE_INDICATOR = """
 MERGE dbo.IndicatorCache AS target
-USING (SELECT ? AS SymbolCode, ? AS Atr14, ? AS Atr20, ? AS Atr22, ? AS Atr26,
-              ? AS Atr50, ? AS ReferencePrice, ? AS SessionsUsed, ? AS AsOfSession,
-              ? AS Method, ? AS Smoothing) AS source
-    ON target.SymbolCode = source.SymbolCode
+USING (SELECT ? AS SymbolCode, ? AS Exchange, ? AS Atr14, ? AS Atr20, ? AS Atr22,
+              ? AS Atr26, ? AS Atr50, ? AS ReferencePrice, ? AS SessionsUsed,
+              ? AS AsOfSession, ? AS Method, ? AS Smoothing) AS source
+    ON target.SymbolCode = source.SymbolCode AND target.Exchange = source.Exchange
 WHEN MATCHED THEN UPDATE SET
     Atr14 = source.Atr14, Atr20 = source.Atr20, Atr22 = source.Atr22, Atr26 = source.Atr26,
     Atr50 = source.Atr50, ReferencePrice = source.ReferencePrice,
     SessionsUsed = source.SessionsUsed, AsOfSession = source.AsOfSession,
     Method = source.Method, Smoothing = source.Smoothing, UpdatedUtc = SYSUTCDATETIME()
 WHEN NOT MATCHED THEN INSERT
-    (SymbolCode, Atr14, Atr20, Atr22, Atr26, Atr50, ReferencePrice, SessionsUsed,
+    (SymbolCode, Exchange, Atr14, Atr20, Atr22, Atr26, Atr50, ReferencePrice, SessionsUsed,
      AsOfSession, Method, Smoothing)
 VALUES
     (source.SymbolCode, source.Atr14, source.Atr20, source.Atr22, source.Atr26,
@@ -301,12 +314,14 @@ class Store:
 
     # -- daily bars --------------------------------------------------------
 
-    def get_daily_bars(self, symbol: str, sessions: int) -> List[Dict[str, Any]]:
+    def get_daily_bars(self, symbol: str, sessions: int,
+                       exchange: str = "US") -> List[Dict[str, Any]]:
         """The last *sessions* completed sessions for one symbol, oldest first."""
-        return self.get_daily_bars_many([symbol], sessions).get(symbol.strip().upper(), [])
+        return self.get_daily_bars_many([symbol], sessions, exchange).get(
+            symbol.strip().upper(), [])
 
     def get_daily_bars_many(
-        self, symbols: Sequence[str], sessions: int,
+        self, symbols: Sequence[str], sessions: int, exchange: str = "US",
     ) -> Dict[str, List[Dict[str, Any]]]:
         """The last *sessions* completed sessions for each symbol, oldest first.
 
@@ -334,12 +349,12 @@ class Store:
                                ROW_NUMBER() OVER (PARTITION BY SymbolCode
                                                   ORDER BY SnapshotDate DESC) AS rn
                         FROM dbo.DailySnapshot
-                        WHERE SymbolCode IN ({placeholders})
+                        WHERE Exchange = ? AND SymbolCode IN ({placeholders})
                     ) ranked
                     WHERE rn <= ?
                     ORDER BY SymbolCode, SnapshotDate
                     """,
-                    *chunk, int(sessions))
+                    _exchange_key(exchange), *chunk, int(sessions))
                 for row in cursor.fetchall():
                     out[str(row[0]).upper()].append({
                         "session": row[1],
@@ -373,7 +388,8 @@ class Store:
         """
         payload = [
             (
-                r["symbol"], r["session"], r["open"], r["high"], r["low"], r["close"],
+                r["symbol"], _exchange_key(r.get("exchange")), r["session"],
+                r["open"], r["high"], r["low"], r["close"],
                 int(r.get("volume") or 0), r.get("source") or "eod-bulk",
                 bool(r.get("adjusted", True)),
             )
@@ -424,7 +440,8 @@ class Store:
 
     # -- indicator cache ---------------------------------------------------
 
-    def get_indicators(self, symbols: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+    def get_indicators(self, symbols: Sequence[str],
+                       exchange: str = "US") -> Dict[str, Dict[str, Any]]:
         wanted = [s.strip().upper() for s in symbols if s and s.strip()]
         if not wanted:
             return {}
@@ -465,6 +482,7 @@ class Store:
         payload = [
             (
                 r["symbol"],
+                _exchange_key(r.get("exchange")),
                 (r.get("values") or {}).get(14),
                 (r.get("values") or {}).get(20),
                 (r.get("values") or {}).get(22),

@@ -441,7 +441,7 @@ class Products:
             raise MarketDataError("bad-sessions", "sessions must be at least 1")
 
         latest = latest_completed_session(market)
-        banked = self.store.get_daily_bars_many(wanted, sessions)
+        banked = self.store.get_daily_bars_many(wanted, sessions, market)
 
         out: Dict[str, Any] = {}
         fetched: List[str] = []
@@ -484,7 +484,8 @@ class Products:
                     out[symbol] = self._bars_payload(symbol, rows, "cache", market)
                 continue
 
-            fresh_rows = self._write_provider_bars(symbol, provider_rows, provider_name)
+            fresh_rows = self._write_provider_bars(symbol, provider_rows, provider_name,
+                                                   market)
             fetched.append(symbol)
             self.counters["bars_from_vendor"] += 1
             fresh_rows = [r for r in fresh_rows if r["session"] <= latest]
@@ -503,7 +504,8 @@ class Products:
         }
 
     def _write_provider_bars(self, symbol: str, bars: Any,
-                             provider_name: Optional[str]) -> List[Dict[str, Any]]:
+                             provider_name: Optional[str],
+                             exchange: str = "US") -> List[Dict[str, Any]]:
         """Upsert provider bars into DailySnapshot and return them in cache-row shape.
 
         ``Source`` records which provider answered, so a series built partly from EODHD and
@@ -514,6 +516,9 @@ class Products:
         for bar in bars:
             rows.append({
                 "symbol": symbol,
+                # The venue travels with the bar: the same ticker can be an ASX listing
+                # and a US one, and without it the two overwrite each other.
+                "exchange": exchange,
                 "session": bar.session,
                 "open": bar.open,
                 "high": bar.high,
@@ -606,7 +611,7 @@ class Products:
         if not wanted:
             raise MarketDataError("no-symbols", "supply at least one symbol")
 
-        cached = self.store.get_indicators(wanted) if cache_eligible else {}
+        cached = self.store.get_indicators(wanted, venue) if cache_eligible else {}
         latest = latest_completed_session(market_code(venue, asset_class))
 
         results: Dict[str, Any] = {}
