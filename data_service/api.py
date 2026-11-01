@@ -472,6 +472,76 @@ def create_app() -> FastAPI:
             ],
         }
 
+    @app.get("/trading_sessions", tags=["market clock"])
+    def get_trading_sessions(
+        request: Request,
+        broker_id: int = Query(1, description="Broker ID to check sessions for"),
+        time: Optional[str] = Query(
+            None,
+            description="Reference time in HH:MM. Read in your local timezone "
+                        "(config clock_user_timezone, default Australia/Sydney) unless "
+                        "use_broker_timezone=True. Omitted means now."),
+        use_broker_timezone: bool = Query(
+            False,
+            description="If True, interpret `time` in the broker's local timezone."),
+    ) -> Any:
+        """The dual-clock sessions for a broker -- a drop-in for McTrader's endpoint.
+
+        Same route, same parameters, same body: a client pointed at this service instead
+        of McTrader's API gets the same answer without touching its parser. The one
+        difference is the reference data: this answers from the service's own copy
+        (data/clock.json), so it keeps answering when McTrader's database is unavailable.
+
+        `time` is read in the OPERATOR's timezone by default, not UTC, because that is what
+        McTrader's endpoint does -- "14:30" there means 14:30 Sydney. Sending a full ISO
+        instant instead is what /market/clock?at= is for, and it is unambiguous.
+        """
+        _attribute(request, "http:/trading_sessions")
+        from datetime import datetime, timezone
+
+        from .clock import clock, resolve_time_zone
+
+        settings = request.app.state.settings
+        instance = clock()
+        now_utc = datetime.now(timezone.utc)
+
+        reference = now_utc
+        if time is not None:
+            parts = time.strip().split(":")
+            try:
+                if len(parts) != 2:
+                    raise ValueError
+                hour, minute = int(parts[0]), int(parts[1])
+            except ValueError:
+                return JSONResponse(status_code=400, content={
+                    "error": f'Invalid time format. Use HH:MM (e.g. "09:30" or "14:00").',
+                    "error_type": "validation_error",
+                    "timestamp": now_utc.isoformat()})
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                return JSONResponse(status_code=400, content={
+                    "error": f'Invalid time: {time}. Hour must be 0-23, minute 0-59.',
+                    "error_type": "validation_error",
+                    "timestamp": now_utc.isoformat()})
+
+            if use_broker_timezone:
+                broker = instance.brokers.get(broker_id) or {}
+                zone = resolve_time_zone(broker.get("timezone"))
+            else:
+                zone = resolve_time_zone(settings.clock_user_timezone)
+            local = now_utc.astimezone(zone).replace(
+                hour=hour, minute=minute, second=0, microsecond=0)
+            reference = local.astimezone(timezone.utc)
+
+        try:
+            payload = instance.broker_clock(broker_id, reference)
+        except KeyError as exc:
+            return JSONResponse(status_code=404, content={
+                "error": str(exc), "error_type": "not_found",
+                "timestamp": now_utc.isoformat()})
+        payload["reference_time_interpreted_in"] = (
+            "broker" if use_broker_timezone else settings.clock_user_timezone)
+        return payload
+
     def _clock_reference_instant(time: Optional[str] = None, at: Optional[str] = None):
         """The instant to resolve against: an ISO stamp, an HH:MM today in UTC, or now."""
         from datetime import datetime, time as clock_time, timezone

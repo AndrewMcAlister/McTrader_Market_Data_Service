@@ -111,6 +111,13 @@ class Settings:
     port: int = 8003
     service_name: str = "McTrader_Market_Data_Service"
 
+    # -- market clock ------------------------------------------------------
+    #: The timezone a bare HH:MM reference time is read in when a caller does not say.
+    #: McTrader's /trading_sessions reads "14:30" as the operator's local time, not UTC,
+    #: and defaults to Australia/Sydney; this endpoint is a drop-in for that one, so it
+    #: has to read it the same way or the same query would mean two different instants.
+    clock_user_timezone: str = "Australia/Sydney"
+
     @property
     def connection_string(self) -> str:
         """The pyodbc connection string, assembled from the fields above."""
@@ -191,4 +198,5 @@ def load(api_key: Optional[str] = None) -> Settings:
         atr_smoothing=_env("MDS_ATR_SMOOTHING", "simple").lower(),
         host=_env("MDS_HOST", "127.0.0.1"),
         port=_env_int("MDS_PORT", 8003),
+        clock_user_timezone=_env("MDS_CLOCK_USER_TIMEZONE", "Australia/Sydney"),
     )
