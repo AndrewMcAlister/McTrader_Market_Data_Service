@@ -5,6 +5,9 @@
 # Runtime output. The service writes here; none of it is source.
 logs/
 data/
+# ...except the market clock's reference data, which is not output: it is the service's
+# own copy of the exchanges and broker rules, and without it the clock cannot answer.
+!data/clock.json
 
 # Manual pre-edit snapshots (*.before_providers and friends). History belongs in git, not in
 # parallel copies of the file next to it.

@@ -400,6 +400,103 @@ def create_app() -> FastAPI:
             code = 503
         return JSONResponse(status_code=code, content=result)
 
+    # -- the market clock ---------------------------------------------------
+    #
+    # The dual-clock model, ported from McTrader's Utils/trading_session.py and given the
+    # service's own copy of the reference data (data/clock.json). GET /market/clock returns
+    # the same payload McTrader's GET /trading_sessions returns, field for field, so the
+    # books can switch by changing a URL rather than a response parser.
+
+    @app.get("/market/clock", tags=["market clock"])
+    def get_market_clock(
+        request: Request,
+        broker_id: int = Query(1, description="Broker Id from the clock reference"),
+        time: Optional[str] = Query(
+            None, description="Reference time HH:MM in UTC; omitted means now"),
+        at: Optional[str] = Query(
+            None, description="Full ISO-8601 reference instant; wins over time"),
+    ) -> Any:
+        _attribute(request, "http:/market/clock")
+        from .clock import clock
+
+        try:
+            reference = _clock_reference_instant(time=time, at=at)
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
+        try:
+            return clock().broker_clock(broker_id, reference)
+        except KeyError as exc:
+            return JSONResponse(status_code=404, content={"error": str(exc)})
+
+    @app.get("/market/session", tags=["market clock"])
+    def get_market_session(
+        request: Request,
+        broker_id: int = Query(1, description="Broker Id from the clock reference"),
+        asset_class: str = Query("shares", description="shares, crypto, etfs, options, ..."),
+        at: Optional[str] = Query(None, description="ISO-8601 instant; omitted means now"),
+    ) -> Any:
+        _attribute(request, "http:/market/session")
+        from .clock import clock
+
+        instance = clock()
+        asset_class_id = instance.asset_class_id(asset_class)
+        if asset_class_id is None:
+            return JSONResponse(status_code=404,
+                                content={"error": f"unknown asset class {asset_class!r}"})
+        try:
+            reference = _clock_reference_instant(at=at)
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
+        session = instance.resolve(broker_id, asset_class_id, reference)
+        payload = session.as_dict()
+        payload["broker_id"] = broker_id
+        payload["asset_class"] = asset_class
+        payload["reference_source"] = instance.source
+        return payload
+
+    @app.get("/market/exchanges", tags=["market clock"])
+    def get_market_exchanges(request: Request) -> Any:
+        """The clock's own copy of the exchange table -- what it will answer from."""
+        _attribute(request, "http:/market/exchanges")
+        from .clock import clock
+
+        instance = clock()
+        return {
+            "source": instance.source,
+            "brokers": list(instance.brokers.values()),
+            "exchanges": list(instance.exchanges.values()),
+            "broker_exchanges": instance.broker_exchanges,
+            "rules": [
+                {"broker_id": key[0], "asset_class_id": key[1], "asset_class": instance.asset_classes.get(key[1], {}).get("name"), **rule}
+                for key, rule in instance.broker_asset_classes.items()
+            ],
+        }
+
+    def _clock_reference_instant(time: Optional[str] = None, at: Optional[str] = None):
+        """The instant to resolve against: an ISO stamp, an HH:MM today in UTC, or now."""
+        from datetime import datetime, time as clock_time, timezone
+
+        if at:
+            stamp = at.strip().replace("Z", "+00:00")
+            try:
+                parsed = datetime.fromisoformat(stamp)
+            except ValueError as exc:
+                raise ValueError(f"at must be ISO-8601, got {at!r}") from exc
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        if time:
+            parts = time.strip().split(":")
+            if len(parts) != 2:
+                raise ValueError(f"time must be HH:MM, got {time!r}")
+            try:
+                hour, minute = int(parts[0]), int(parts[1])
+            except ValueError as exc:
+                raise ValueError(f"time must be HH:MM, got {time!r}") from exc
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                raise ValueError(f"time out of range: {time!r}")
+            now = datetime.now(timezone.utc)
+            return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        return None
+
     # -- the four data endpoints -------------------------------------------
 
     @app.get("/price/{symbol}", tags=["market data"])
