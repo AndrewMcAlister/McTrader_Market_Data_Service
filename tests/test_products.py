@@ -1,4 +1,4 @@
-﻿"""The products layer: routing, caching and provenance, with no vendor and no database.
+"""The products layer: routing, caching and provenance, with no vendor and no database.
 
 The two decisions most worth pinning are:
 
@@ -458,6 +458,34 @@ def test_stop_level_is_attached_when_both_are_supplied():
     reading = result["atr"]["AAPL"]
     assert reading["value"] is not None
     assert reading["stop_level"] == pytest.approx(100.0 - reading["value"], abs=1e-6)
+
+
+def test_a_zero_multiplier_is_a_reason_not_a_500():
+    """A body that fills every field of the schema sends multiplier=0. It must come back as a
+    named 400, not the AtrError the arithmetic raises (which reached the client as a 500)."""
+    products, _, _ = _products()
+    with pytest.raises(MarketDataError) as exc:
+        products.atr_batch(["AAPL"], period=14, price=100.0, multiplier=0)
+    assert exc.value.reason == "bad-multiplier"
+    assert exc.value.status == 400
+
+
+def test_a_bad_direction_is_a_reason_not_a_500():
+    products, _, _ = _products()
+    with pytest.raises(MarketDataError) as exc:
+        products.atr_batch(["AAPL"], period=14, price=100.0, multiplier=1.0,
+                           direction="sideways")
+    assert exc.value.reason == "bad-direction"
+
+
+def test_the_minimal_request_is_atr_14_with_the_default_definition():
+    """{"symbols": ["AAPL"]} is the whole request: period 14, tr, simple, venue US."""
+    products, _, _ = _products()
+    result = products.atr_batch(["AAPL"])
+    assert result["period"] == 14
+    assert result["method"] == "tr"
+    assert result["smoothing"] == "simple"
+    assert result["atr"]["AAPL"]["period"] == 14
 
 
 def test_a_different_smoothing_is_computed_and_not_written_to_the_cache():

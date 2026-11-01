@@ -737,9 +737,22 @@ class Products:
                     "incomplete-stop",
                     "stop_level needs both price and multiplier (the multiplier is never "
                     "defaulted: the books use 1.0, 1.0, 2.0 and 3.0)")
+            # Validated here so a bad stop is a 400 with a reason, not the AtrError the
+            # arithmetic raises deeper down -- which reaches the client as a 500 and reads
+            # like a broken service. A zero is the common one: it arrives whenever a caller
+            # sends every field of the schema rather than only the two that are set.
+            if float(multiplier) <= 0:
+                raise MarketDataError(
+                    "bad-multiplier",
+                    f"multiplier must be positive, got {multiplier!r}; it is never defaulted")
+            side = str(direction or "long").strip().lower()
+            if side not in ("long", "short"):
+                raise MarketDataError(
+                    "bad-direction",
+                    f"{direction!r} is not a direction; use 'long' or 'short'")
             for symbol, reading in results.items():
                 reading["stop_level"] = atr_module.stop_level(
-                    float(price), reading.get("value"), float(multiplier), direction)
+                    float(price), reading.get("value"), float(multiplier), side)
 
         return {
             "atr": results,

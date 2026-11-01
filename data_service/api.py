@@ -32,7 +32,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from . import __version__, config as config_module
 from .eodhd import EodhdError
@@ -50,8 +50,14 @@ log = logging.getLogger("data_service.api")
 # ---------------------------------------------------------------------------
 
 class PricesRequest(BaseModel):
+    """Every field but ``symbols`` is optional; the examples show the smallest request."""
+
+    model_config = ConfigDict(json_schema_extra={
+        "examples": [{"symbols": ["AAPL", "MSFT"]}]})
+
     symbols: List[str] = Field(..., min_length=1, description="Bare or suffixed symbols")
-    venue: str = Field("US", description="Venue/country code, e.g. US, AU, L, TO")
+    venue: Optional[str] = Field(
+        None, description="Venue/country code, e.g. US (default), AU, L, TO")
     max_age_seconds: Optional[float] = Field(
         None, description="Lower the 5-minute cache window; cannot raise it")
     asset_class: Optional[str] = Field(
@@ -61,18 +67,32 @@ class PricesRequest(BaseModel):
 
 
 class AtrRequest(BaseModel):
+    """Only ``symbols`` is required.
+
+    ``{"symbols": ["TSLA"]}`` asks for ATR(14) with the standard definition, at venue US,
+    with no stop level -- every other field is an override, and the defaults are stated on
+    the field rather than filled in here.
+    """
+
+    model_config = ConfigDict(json_schema_extra={
+        "examples": [
+            {"symbols": ["TSLA"]},
+            {"symbols": ["TSLA"], "period": 22, "price": 231.4, "multiplier": 1.0},
+        ]})
+
     symbols: List[str] = Field(..., min_length=1)
     period: Optional[int] = Field(None, description="Default 14")
     method: Optional[str] = Field(
         None, description="'tr' (gap-inclusive, default) or 'high_low'")
     smoothing: Optional[str] = Field(
         None, description="'simple' (default, what the stop books use) or 'wilder'")
-    venue: str = "US"
+    venue: Optional[str] = Field(
+        None, description="Venue/exchange code, e.g. US (default), AU, L, TO")
     price: Optional[float] = Field(
         None, description="Supply with multiplier to also get a stop_level")
     multiplier: Optional[float] = Field(
         None, description="ATR multiple for the stop. Required if price is given; never defaulted")
-    direction: str = Field("long", description="'long' or 'short'")
+    direction: Optional[str] = Field(None, description="'long' (default) or 'short'")
     asset_class: Optional[str] = Field(None, description="shares (default) or crypto, ...")
 
 
@@ -100,9 +120,15 @@ class RefreshRequest(BaseModel):
 
 
 class BarsRequest(BaseModel):
+    """Only ``symbols`` is required; ``{"symbols": ["TSLA"]}`` returns 15 signed-off sessions."""
+
+    model_config = ConfigDict(json_schema_extra={
+        "examples": [{"symbols": ["TSLA"]}]})
+
     symbols: List[str] = Field(..., min_length=1)
     sessions: int = Field(15, ge=1, description="Completed sessions to return")
-    venue: str = "US"
+    venue: Optional[str] = Field(
+        None, description="Venue/exchange code, e.g. US (default), AU, L, TO")
     allow_fetch: bool = Field(
         True, description="False = answer only from DailySnapshot, never the vendor")
     asset_class: Optional[str] = Field(None, description="shares (default) or crypto, ...")
@@ -870,7 +896,8 @@ def create_app() -> FastAPI:
                                 content={"error": "vendor-unavailable"})
         try:
             return products.prices(
-                body.symbols, venue=body.venue, max_age_seconds=body.max_age_seconds,
+                body.symbols, venue=body.venue or "US",
+                max_age_seconds=body.max_age_seconds,
                 asset_class=body.asset_class)
         except MarketDataError as exc:
             return _error(exc)
@@ -891,10 +918,10 @@ def create_app() -> FastAPI:
                 period=body.period,
                 method=body.method,
                 smoothing=body.smoothing,
-                venue=body.venue,
+                venue=body.venue or "US",
                 price=body.price,
                 multiplier=body.multiplier,
-                direction=body.direction,
+                direction=body.direction or "long",
                 asset_class=body.asset_class,
             )
         except MarketDataError as exc:
@@ -912,7 +939,7 @@ def create_app() -> FastAPI:
                                 content={"error": "vendor-unavailable"})
         try:
             return products.bars(
-                body.symbols, sessions=body.sessions, venue=body.venue,
+                body.symbols, sessions=body.sessions, venue=body.venue or "US",
                 allow_fetch=body.allow_fetch, asset_class=body.asset_class)
         except MarketDataError as exc:
             return _error(exc)
