@@ -38,9 +38,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from data_service import atr as atr_module
 from data_service import config as config_module
-from data_service.eodhd import EodhdClient, EodhdError, bare_symbol
+from data_service.eodhd import EodhdClient, EodhdError, bare_symbol, normalise_venue
 from data_service.usage import Tariff, UsageLedger, set_caller
-from data_service.store import Store, _float
+from data_service.store import Store, _exchange_key, _float
 
 log = logging.getLogger("data_service.daily")
 
@@ -69,7 +69,9 @@ def _row_from_bulk(raw: Dict[str, Any], session_date: date,
 
     return {
         "symbol": code,
-        "exchange": str(market or "US").strip().upper(),
+        # The venue is stamped on the row rather than assumed at read time: the ASX and the
+        # US both file 2026-10-30, and a symbol-only key is how one overwrote the other.
+        "exchange": _exchange_key(market, required=True),
         "session": session_date,
         "open": open_,
         "high": high,
@@ -104,6 +106,9 @@ def pull_bulk(store: Store, client: EodhdClient, market: str = "US",
     session_dates = dates or [None]
     total = 0
     per_session: List[Dict[str, Any]] = []
+    # Normalised once, here: "ASX" and "AU" are the same venue, an unknown one is refused
+    # before a unit is spent, and the value written to the row is the one reads filter on.
+    market = normalise_venue(market)
 
     for wanted in session_dates:
         rows = client.bulk_last_day(market, session_date=wanted)
@@ -129,7 +134,7 @@ def pull_bulk(store: Store, client: EodhdClient, market: str = "US",
         unadjusted = 0
         for raw in rows:
             symbol = bare_symbol(str(raw.get("code") or ""))
-            row = _row_from_bulk(raw, session_date, symbol)
+            row = _row_from_bulk(raw, session_date, symbol, market)
             if row is None:
                 continue
             if not row["adjusted"]:
@@ -144,8 +149,8 @@ def pull_bulk(store: Store, client: EodhdClient, market: str = "US",
             "written": written,
             "rows_without_adjusted_close": unadjusted,
         })
-        log.info("session %s: %d received, %d written, %d without adjusted_close",
-                 resolved, len(rows), written, unadjusted)
+        log.info("%s session %s: %d received, %d written, %d without adjusted_close",
+                 market, resolved, len(rows), written, unadjusted)
 
     return {"sessions": per_session, "rows_written": total}
 
@@ -183,14 +188,20 @@ ORDER BY SymbolCode, SessionDate
 """
 
 
-def seed_from_barhourly(store: Store, days: int = 90, chunk: int = 20000) -> Dict[str, Any]:
+def seed_from_barhourly(store: Store, days: int = 90, chunk: int = 20000,
+                        market: str = "US") -> Dict[str, Any]:
     """Aggregate Back_Test.BarHourly into DailySnapshot. Costs no vendor units.
 
     BarHourly is split-adjusted and already paid for, so it is the correct source for the
     history ATR needs on day one. Rows are written with source='barhourly' and
     IsAdjusted=1; the daily job's own pulls then carry the series forward with
     source='eod-bulk'.
+
+    BarHourly is the US tape, so the venue defaults to US. ``market`` exists so that a
+    warehouse that later carries another venue is stamped with it rather than assumed --
+    the same reason every other write states its exchange.
     """
+    exchange = _exchange_key(normalise_venue(market), required=True)
     since = (date.today() - timedelta(days=days)).isoformat()
     conn = store.connect()
     try:
@@ -200,7 +211,8 @@ def seed_from_barhourly(store: Store, days: int = 90, chunk: int = 20000) -> Dic
     finally:
         conn.close()
 
-    log.info("BarHourly aggregated %d symbol-sessions since %s", len(rows), since)
+    log.info("BarHourly aggregated %d symbol-sessions since %s (%s)",
+             len(rows), since, exchange)
 
     payload: List[Dict[str, Any]] = []
     for code, session, open_, high, low, close, volume in rows:
@@ -209,6 +221,7 @@ def seed_from_barhourly(store: Store, days: int = 90, chunk: int = 20000) -> Dic
             continue
         payload.append({
             "symbol": str(code).strip().upper(),
+            "exchange": exchange,
             "session": session,
             "open": open_f, "high": high_f, "low": low_f, "close": close_f,
             "volume": int(volume or 0),
@@ -254,8 +267,10 @@ def rebuild_indicators(store: Store, settings: config_module.Settings,
     # can exist on both. Batching stays one query per chunk of symbols.
     for exchange in sorted({venue for _, venue in symbols}):
         venue_symbols = [symbol for symbol, venue in symbols if venue == exchange]
-        written += _rebuild_for(store, settings, venue_symbols, exchange,
-                                periods, need, chunk)
+        count = _rebuild_for(store, settings, venue_symbols, exchange,
+                             periods, need, chunk)
+        written += count
+        log.info("  %s: %d indicator row(s)", exchange, count)
     log.info("IndicatorCache rebuilt for %d symbol(s)", written)
     return {"symbols_considered": len(symbols), "indicators_written": written}
 
@@ -282,7 +297,6 @@ def _rebuild_for(store: Store, settings: config_module.Settings, symbols: List[s
             if values.get(periods[0]) is None:
                 continue
             rows.append({
-                "symbol": symbol,
                 "symbol": symbol,
                 "exchange": exchange,
                 "values": values,
@@ -346,7 +360,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     summary: Dict[str, Any] = {}
 
     if args.seed_from_barhourly:
-        summary["seed"] = seed_from_barhourly(store, days=args.days)
+        summary["seed"] = seed_from_barhourly(store, days=args.days, market=args.market)
 
     if not args.rebuild_indicators:
         if settings.eodhd_api_key:
@@ -383,7 +397,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     log.info("done in %.1fs: %s", summary["elapsed_seconds"], summary.get("database"))
     for entry in summary.get("sessions", []):
-        log.info("  session %s: %d symbols", entry["session"], entry["symbols"])
+        log.info("  session %s %s: %d symbols",
+                 entry["session"], entry["exchange"], entry["symbols"])
     return 0
 
 

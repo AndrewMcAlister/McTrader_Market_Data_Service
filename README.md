@@ -120,6 +120,10 @@ definition cannot be reproduced.
   multiplier is never defaulted: the four books use 1.0, 1.0, 2.0 and 3.0, so a default would
   silently impose one book's risk on another's.
 
+**The ATR is one venue's ATR.** `IndicatorCache` is keyed by `(symbol, exchange)`, so an ASX
+`CBA` is never served the US `CBA`'s volatility — which, with a symbol-only key, is exactly
+what would have happened.
+
 ### `POST /bars`
 
 ```json
@@ -137,6 +141,11 @@ definition cannot be reproduced.
   "fetched": [], "short_history": [], "complete": true, "requested_sessions": 15
 }
 ```
+
+`venue` selects which series is read, because `DailySnapshot` is keyed by exchange: `AAPL` at
+`venue=AU` is a different instrument from `AAPL` at `venue=US`, not a misspelling to fall back
+from. A venue whose series is short answers `short_history`; it does not borrow the other
+venue's bars.
 
 The session in progress is **dropped here**, in the service, not by each caller — a partial
 session has a partial range and using it shrinks a stop exactly when the morning is quiet.
@@ -279,11 +288,24 @@ Three tables, created by `sql/001_schema.sql`, in the database `MDS_DATABASE` po
 | Table | Grain | Holds |
 |---|---|---|
 | `SymbolPriceCache` | symbol × venue | latest known price, overwritten in place |
-| `DailySnapshot` | symbol × session | daily OHLCV, appended once per session |
-| `IndicatorCache` | symbol | precomputed ATR 14/20/22/26/50 |
+| `DailySnapshot` | symbol × exchange × session | daily OHLCV, appended once per session per venue |
+| `IndicatorCache` | symbol × exchange | precomputed ATR 14/20/22/26/50 for one venue's series |
 
 Notes that are load-bearing:
 
+- **The bar tables are keyed by exchange as well as symbol.** A bare ticker is not unique —
+  `CBA` is an ASX listing and a US one — and a symbol-only key lets one venue's row overwrite
+  the other's without a word. `DailySnapshot` is `(SymbolCode, Exchange, SnapshotDate)` and
+  `IndicatorCache` is `(SymbolCode, Exchange)`, so every read and write states the venue.
+  `SymbolPriceCache` calls the same code `Venue` because it got there first; both columns hold
+  the vendor's exchange code (`US`, `AU`, ...).
+- **Rows written before 2026-11-01 were backfilled** from the price cache: US, unless that
+  symbol was known on the ASX and nowhere else. That reassigned 18,363 rows that had been AU
+  all along and were indistinguishable from US ones.
+- **The ATR cache was cleared once**, when the venue key was added: every row in it had been
+  computed under a symbol-only key, so it was either labelled with the wrong venue or had both
+  venues' bars mixed into one number. It refills from the next daily refresh, or from `/atr`
+  on demand.
 - **`IndicatorCache` carries 22 and 26 as well as the specified 14/20/50.** 22 is McTrader's
   Chandelier window and its preferred stop ATR; 26 is PortfolioAdvisor's MACD-V divisor. 20
   and 50 are read by nothing today.

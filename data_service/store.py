@@ -8,6 +8,12 @@ Upserts use ``MERGE`` rather than update-then-insert because the daily job write
 rows at a time and two round trips per row would turn a one-second load into a minute. All
 writes are batched through ``executemany`` with ``fast_executemany`` on.
 
+Both bar tables are keyed by venue as well as symbol. A bare ticker is not unique -- the same
+code can be an ASX listing and a US one -- so a symbol-only key lets one venue's row
+overwrite the other's without a word. The price cache has always carried ``Venue`` for that
+reason; the bar tables carry ``Exchange``, which is the same market code under the name the
+vendor and its feeds use for it (``US``, ``AU``, ...).
+
 Decimals arrive from pyodbc as ``decimal.Decimal`` and are converted to ``float`` at the
 boundary: every consumer downstream (ATR, JSON) works in floats, and mixing the two is how
 a rounding rule gets invented by accident.
@@ -29,7 +35,9 @@ SCHEMA_PATH = Path(__file__).resolve().parent.parent / "sql" / "001_schema.sql"
 _MERGE_DAILY_FROM_STAGE = """
 MERGE dbo.DailySnapshot AS target
 USING #stage AS source
-    ON target.SymbolCode = source.SymbolCode AND target.SnapshotDate = source.SnapshotDate
+    ON target.SymbolCode = source.SymbolCode
+   AND target.Exchange = source.Exchange
+   AND target.SnapshotDate = source.SnapshotDate
 WHEN MATCHED THEN UPDATE SET
     [Open] = source.[Open], [High] = source.[High], [Low] = source.[Low],
     [Close] = source.[Close], Volume = source.Volume, Source = source.Source,
@@ -38,13 +46,15 @@ WHEN NOT MATCHED THEN INSERT
     (SymbolCode, Exchange, SnapshotDate, [Open], [High], [Low], [Close], Volume, Source,
      IsAdjusted)
 VALUES
-    (source.SymbolCode, source.SnapshotDate, source.[Open], source.[High], source.[Low],
-     source.[Close], source.Volume, source.Source, source.IsAdjusted);
+    (source.SymbolCode, source.Exchange, source.SnapshotDate, source.[Open],
+     source.[High], source.[Low], source.[Close], source.Volume, source.Source,
+     source.IsAdjusted);
 """
 
 _CREATE_STAGE_DAILY = """
 CREATE TABLE #stage (
     SymbolCode   varchar(24)   NOT NULL,
+    Exchange     varchar(8)    NOT NULL,
     SnapshotDate date          NOT NULL,
     [Open]       decimal(18,6) NOT NULL,
     [High]       decimal(18,6) NOT NULL,
@@ -56,14 +66,21 @@ CREATE TABLE #stage (
 );
 """
 
-def _exchange_key(value: Any) -> str:
-    """Normalise a venue to the Exchange column's value: an upper-case market code.
+def _exchange_key(value: Any, *, required: bool = False) -> str:
+    """The Exchange column's value for a venue: an upper-case market code.
 
-    Defaults to US, which is what every row written before 2026-11-01 actually was and
-    what a caller that says nothing about its venue means.
+    A read defaults to US, which is what a caller that says nothing about its venue means
+    and what the API itself defaults to. A write passes ``required=True``: a bar whose venue
+    was forgotten is not a US bar, it is an unknown one -- and defaulting it is exactly how
+    an ASX session came to be filed as US in the first place.
     """
     text = str(value or "").strip().upper()
-    return text or "US"
+    if text:
+        return text
+    if required:
+        raise ValueError(
+            "a bar row must carry its exchange; refusing to file an unknown venue as US")
+    return "US"
 
 
 _MERGE_PRICE = """
@@ -86,24 +103,6 @@ VALUES
      source.LastUpdatedUtc, source.Source);
 """
 
-_MERGE_DAILY = """
-MERGE dbo.DailySnapshot AS target
-USING (SELECT ? AS SymbolCode, ? AS Exchange, ? AS SnapshotDate, ? AS [Open], ? AS [High],
-              ? AS [Low], ? AS [Close], ? AS Volume, ? AS Source, ? AS IsAdjusted) AS source
-    ON target.SymbolCode = source.SymbolCode
-   AND target.Exchange = source.Exchange
-   AND target.SnapshotDate = source.SnapshotDate
-WHEN MATCHED THEN UPDATE SET
-    [Open] = source.[Open], [High] = source.[High], [Low] = source.[Low],
-    [Close] = source.[Close], Volume = source.Volume, Source = source.Source,
-    IsAdjusted = source.IsAdjusted, LoadedUtc = SYSUTCDATETIME()
-WHEN NOT MATCHED THEN INSERT
-    (SymbolCode, SnapshotDate, [Open], [High], [Low], [Close], Volume, Source, IsAdjusted)
-VALUES
-    (source.SymbolCode, source.SnapshotDate, source.[Open], source.[High], source.[Low],
-     source.[Close], source.Volume, source.Source, source.IsAdjusted);
-"""
-
 _MERGE_INDICATOR = """
 MERGE dbo.IndicatorCache AS target
 USING (SELECT ? AS SymbolCode, ? AS Exchange, ? AS Atr14, ? AS Atr20, ? AS Atr22,
@@ -119,9 +118,9 @@ WHEN NOT MATCHED THEN INSERT
     (SymbolCode, Exchange, Atr14, Atr20, Atr22, Atr26, Atr50, ReferencePrice, SessionsUsed,
      AsOfSession, Method, Smoothing)
 VALUES
-    (source.SymbolCode, source.Atr14, source.Atr20, source.Atr22, source.Atr26,
-     source.Atr50, source.ReferencePrice, source.SessionsUsed, source.AsOfSession,
-     source.Method, source.Smoothing);
+    (source.SymbolCode, source.Exchange, source.Atr14, source.Atr20, source.Atr22,
+     source.Atr26, source.Atr50, source.ReferencePrice, source.SessionsUsed,
+     source.AsOfSession, source.Method, source.Smoothing);
 """
 
 
@@ -388,7 +387,7 @@ class Store:
         """
         payload = [
             (
-                r["symbol"], _exchange_key(r.get("exchange")), r["session"],
+                r["symbol"], _exchange_key(r.get("exchange"), required=True), r["session"],
                 r["open"], r["high"], r["low"], r["close"],
                 int(r.get("volume") or 0), r.get("source") or "eod-bulk",
                 bool(r.get("adjusted", True)),
@@ -404,8 +403,9 @@ class Store:
             cursor.execute(_CREATE_STAGE_DAILY)
             for start in range(0, len(payload), 20000):
                 cursor.executemany(
-                    "INSERT INTO #stage (SymbolCode, SnapshotDate, [Open], [High], [Low], "
-                    "[Close], Volume, Source, IsAdjusted) VALUES (?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO #stage (SymbolCode, Exchange, SnapshotDate, [Open], [High], "
+                    "[Low], [Close], Volume, Source, IsAdjusted) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
                     payload[start:start + 20000])
             cursor.execute(_MERGE_DAILY_FROM_STAGE)
             conn.commit()
@@ -425,16 +425,28 @@ class Store:
             conn.close()
 
     def session_symbol_counts(self, limit: int = 5) -> List[Dict[str, Any]]:
-        """Symbols per recent session. Used by the job to prove a load actually landed."""
+        """Symbols landed per recent session, per exchange.
+
+        Per exchange because a session date is not one load: the ASX and the US can both
+        write 2026-10-30, and a single count would say "44,000 symbols" for what is two
+        separate collections. The outer query is limited by *sessions*, not by rows, so
+        ``limit=5`` is still five sessions even when both venues are present.
+        """
         conn = self.connect()
         try:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                SELECT TOP (?) SnapshotDate, COUNT(*) AS symbols
-                FROM dbo.DailySnapshot GROUP BY SnapshotDate ORDER BY SnapshotDate DESC
+                SELECT SnapshotDate, Exchange, COUNT(*) AS symbols
+                FROM dbo.DailySnapshot
+                WHERE SnapshotDate IN (
+                    SELECT TOP (?) SnapshotDate FROM dbo.DailySnapshot
+                    GROUP BY SnapshotDate ORDER BY SnapshotDate DESC)
+                GROUP BY SnapshotDate, Exchange
+                ORDER BY SnapshotDate DESC, Exchange
                 """, int(limit))
-            return [{"session": r[0], "symbols": int(r[1])} for r in cursor.fetchall()]
+            return [{"session": r[0], "exchange": r[1], "symbols": int(r[2])}
+                    for r in cursor.fetchall()]
         finally:
             conn.close()
 
@@ -442,6 +454,12 @@ class Store:
 
     def get_indicators(self, symbols: Sequence[str],
                        exchange: str = "US") -> Dict[str, Dict[str, Any]]:
+        """The cached ATR for *symbols* at one exchange, keyed by bare symbol.
+
+        The venue is part of the key, so it is part of the question: the same ticker can
+        have a US series and an ASX one, and two different ATRs. Without the filter the
+        answer for the second venue would be whichever row the database happened to return.
+        """
         wanted = [s.strip().upper() for s in symbols if s and s.strip()]
         if not wanted:
             return {}
@@ -458,8 +476,8 @@ class Store:
                     SELECT SymbolCode, Atr14, Atr20, Atr22, Atr26, Atr50, ReferencePrice,
                            SessionsUsed, AsOfSession, Method, Smoothing, UpdatedUtc
                     FROM dbo.IndicatorCache
-                    WHERE SymbolCode IN ({placeholders})
-                    """, *chunk)
+                    WHERE Exchange = ? AND SymbolCode IN ({placeholders})
+                    """, _exchange_key(exchange), *chunk)
                 for row in cursor.fetchall():
                     out[str(row[0]).upper()] = {
                         "symbol": str(row[0]).upper(),
@@ -482,7 +500,7 @@ class Store:
         payload = [
             (
                 r["symbol"],
-                _exchange_key(r.get("exchange")),
+                _exchange_key(r.get("exchange"), required=True),
                 (r.get("values") or {}).get(14),
                 (r.get("values") or {}).get(20),
                 (r.get("values") or {}).get(22),
@@ -638,8 +656,9 @@ class Store:
         stamp -- it is the only evidence such a row carries.
 
         Venue-tagged, which is what makes a per-country answer possible at all:
-        SymbolPriceCache carries a Venue column; DailySnapshot does not, because a bare
-        ticker is the same string for an ASX listing and a US one.
+        SymbolPriceCache carries a Venue column. DailySnapshot carries Exchange for the same
+        reason but is deliberately not consulted here -- the question is about prices
+        collected since the open, not about settled bars.
 
         Returns a NAIVE datetime: the columns are datetime2 and hold UTC that lost its
         label. Callers must attach UTC rather than localising it (availability._as_utc).
@@ -733,7 +752,11 @@ class Store:
             conn.close()
 
     def stats(self) -> Dict[str, Any]:
-        """Row counts, for /stats and the job's log line."""
+        """Row counts, for /stats and the job's log line.
+
+        ``daily_symbols`` counts (symbol, exchange) pairs, not bare tickers: one ticker on
+        two venues is two series, and the count that matters is the number of series.
+        """
         conn = self.connect()
         try:
             cursor = conn.cursor()
@@ -741,12 +764,18 @@ class Store:
                 SELECT
                     (SELECT COUNT(*) FROM dbo.SymbolPriceCache),
                     (SELECT COUNT(*) FROM dbo.DailySnapshot),
-                    (SELECT COUNT(DISTINCT SymbolCode) FROM dbo.DailySnapshot),
+                    (SELECT COUNT(*) FROM
+                        (SELECT DISTINCT SymbolCode, Exchange FROM dbo.DailySnapshot) AS s),
                     (SELECT COUNT(*) FROM dbo.IndicatorCache),
                     (SELECT MAX(SnapshotDate) FROM dbo.DailySnapshot),
                     (SELECT MAX(LastUpdatedUtc) FROM dbo.SymbolPriceCache)
             """)
             row = cursor.fetchone()
+            cursor.execute("""
+                SELECT Exchange, COUNT(*) AS bars FROM dbo.DailySnapshot
+                GROUP BY Exchange ORDER BY Exchange
+            """)
+            by_exchange = [{"exchange": r[0], "bars": int(r[1])} for r in cursor.fetchall()]
         finally:
             conn.close()
         return {
@@ -756,5 +785,6 @@ class Store:
             "indicator_rows": int(row[3] or 0),
             "latest_session": row[4].isoformat() if row[4] else None,
             "latest_price_at": row[5].isoformat() if row[5] else None,
+            "daily_by_exchange": by_exchange,
         }
 

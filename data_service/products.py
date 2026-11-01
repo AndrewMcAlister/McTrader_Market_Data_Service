@@ -505,12 +505,14 @@ class Products:
 
     def _write_provider_bars(self, symbol: str, bars: Any,
                              provider_name: Optional[str],
-                             exchange: str = "US") -> List[Dict[str, Any]]:
+                             exchange: str) -> List[Dict[str, Any]]:
         """Upsert provider bars into DailySnapshot and return them in cache-row shape.
 
         ``Source`` records which provider answered, so a series built partly from EODHD and
         partly from Yahoo is visible rather than silent. ``IsAdjusted`` travels with each bar
         because an ATR mixing adjusted and raw closes reads a split as a catastrophic move.
+        ``exchange`` is required rather than defaulted: the row cannot be filed without the
+        venue it belongs to.
         """
         rows: List[Dict[str, Any]] = []
         for bar in bars:
@@ -611,8 +613,12 @@ class Products:
         if not wanted:
             raise MarketDataError("no-symbols", "supply at least one symbol")
 
-        cached = self.store.get_indicators(wanted, venue) if cache_eligible else {}
-        latest = latest_completed_session(market_code(venue, asset_class))
+        # One normalised market for the whole call: the ATR cache is keyed by venue, so the
+        # read has to ask with the same code the bars were written under ("ASX" and "AU" are
+        # one venue, and AU is what is stored).
+        market = market_code(venue, asset_class)
+        cached = self.store.get_indicators(wanted, market) if cache_eligible else {}
+        latest = latest_completed_session(market)
 
         results: Dict[str, Any] = {}
         to_compute: List[str] = []
@@ -702,6 +708,9 @@ class Products:
                 if cache_eligible and value is not None:
                     fresh_for_cache.append({
                         "symbol": symbol,
+                        # The venue the bars came from. Without it the row lands as US, and
+                        # the next AU request reads a US ATR out of the cache.
+                        "exchange": market,
                         "values": values,
                         "reference_price": reference,
                         "sessions_used": len(rows),

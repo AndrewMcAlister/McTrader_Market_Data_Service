@@ -159,6 +159,10 @@ else computed from daily bars.
 | `reason` | why `value` is `null` |
 | `stop_level` | present only when `price` and `multiplier` were both supplied |
 
+`venue` chooses the series the ATR is measured on: `IndicatorCache` is keyed by
+`(symbol, exchange)`, so an ASX `CBA` and a US `CBA` have separate ATRs and neither is served
+for the other.
+
 **The ATR definition, exactly:**
 
 ```
@@ -208,6 +212,10 @@ Completed daily bars.
 | `adjusted` | whether the series is split-adjusted |
 | `provider` | `cache` or the provider that answered (`eodhd`, `yahoo`, `binance`) |
 | `short_history` | symbols with fewer sessions than asked |
+
+`venue` chooses the series: the cache is keyed by `(symbol, exchange)`, so `AAPL` at
+`venue=AU` is a different instrument from `AAPL` at `venue=US`. A venue with a short series
+answers `short_history` rather than borrowing the other venue's bars.
 
 `allow_fetch: false` answers only from the database and never calls a vendor.
 
@@ -323,6 +331,9 @@ A provider that cannot serve an asset class is never asked — Binance is never 
 8. **Whole-market responses are large** (~12,700 rows, ~2 MB). If you only need the top movers, sort
    locally rather than shortening the list — a shorter list can drop below the 100-symbol break-even
    and become *more* expensive.
+9. **A ticker is not unique across venues.** `CBA` is both an ASX listing and a US one, so `venue`
+   is part of the instrument's identity, not a formatting hint: send it, and expect `short_history`
+   rather than another venue's bars when the requested venue has no series.
 
 ---
 
