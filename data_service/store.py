@@ -558,6 +558,32 @@ class Store:
         finally:
             conn.close()
 
+    def latest_venue_price(self, venue: str) -> Optional[datetime]:
+        """The observation time of the newest price stored for ``venue``.
+
+        Observation, not write time, because "is today's data in?" is a question about the
+        market's clock: a row written now from a quote stamped before the open is not
+        today's data. ``LastUpdatedUtc`` is the fallback for a provider that sends no
+        stamp -- it is the only evidence such a row carries.
+
+        Venue-tagged, which is what makes a per-country answer possible at all:
+        SymbolPriceCache carries a Venue column; DailySnapshot does not, because a bare
+        ticker is the same string for an ASX listing and a US one.
+
+        Returns a NAIVE datetime: the columns are datetime2 and hold UTC that lost its
+        label. Callers must attach UTC rather than localising it (availability._as_utc).
+        """
+        conn = self.connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT MAX(COALESCE(AsOfUtc, LastUpdatedUtc)) FROM dbo.SymbolPriceCache "
+                "WHERE Venue = ?", venue)
+            row = cursor.fetchone()
+            return row[0] if row and row[0] is not None else None
+        finally:
+            conn.close()
+
     def bulk_pull_count(self, request_type: str,
                         usage_date: Optional[date] = None) -> int:
         """How many calls of *request_type* the ledger records for the day. Free to ask.

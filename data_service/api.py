@@ -654,6 +654,52 @@ def create_app() -> FastAPI:
             "broker" if use_broker_timezone else settings.clock_user_timezone)
         return payload
 
+    @app.get("/todays-data-is-available", tags=["market data"])
+    def get_todays_data_is_available(
+        request: Request,
+        country_code: str = Query("US", description="us/US or au/AU"),
+    ) -> Any:
+        """Is there data for this country collected since its session opened today?
+
+        The body is a bare boolean, because that is the question: a caller deciding whether
+        to rank does not want to unpack an object to get one bit. The evidence that
+        produced it rides in the response headers, so a person debugging still sees the two
+        instants it compared:
+
+            X-Dataset-Country, X-Dataset-Venue, X-Dataset-Latest-Price,
+            X-Session-Open, X-Session-Close, X-Session-Is-Open
+
+        False is not an error: before the open, on a weekend, or with only yesterday's
+        prices stored, the answer is false and the status is 200. A country code that is
+        not us/au is a 400 -- that one is a caller's mistake.
+        """
+        _attribute(request, "http:/todays-data-is-available")
+        from .availability import COUNTRIES, check, country_key
+        from .clock import clock
+
+        try:
+            country = country_key(country_code)
+        except KeyError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
+
+        store = request.app.state.store
+        venue = COUNTRIES[country][0]
+        try:
+            latest = store.latest_venue_price(venue)
+        except Exception as exc:  # noqa: BLE001 - an unreadable store cannot vouch for data
+            log.warning("todays-data-is-available: could not read the price cache (%s)", exc)
+            latest = None
+
+        result = check(clock(), latest, country)
+        return JSONResponse(status_code=200, content=result.available, headers={
+            "X-Dataset-Country": result.country,
+            "X-Dataset-Venue": result.venue,
+            "X-Dataset-Latest-Price": result.latest_utc.isoformat() if result.latest_utc else "",
+            "X-Session-Open": result.session_open_utc.isoformat() if result.session_open_utc else "",
+            "X-Session-Close": result.session_close_utc.isoformat() if result.session_close_utc else "",
+            "X-Session-Is-Open": "true" if result.session_is_open else "false",
+        })
+
     def _clock_reference_instant(time: Optional[str] = None, at: Optional[str] = None):
         """The instant to resolve against: an ISO stamp, an HH:MM today in UTC, or now."""
         from datetime import datetime, time as clock_time, timezone
