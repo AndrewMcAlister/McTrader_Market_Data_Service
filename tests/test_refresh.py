@@ -57,7 +57,14 @@ def test_an_unreadable_ledger_is_treated_as_stale():
 
 
 def test_the_request_type_is_the_flat_priced_bulk_call():
-    assert refresh.BULK_REQUEST_TYPE == "/eod-bulk-last-day/US"
+    assert refresh.bulk_request_type("US") == "/eod-bulk-last-day/US"
+
+
+def test_each_market_has_its_own_freshness_row():
+    """The type was hard-coded to /US until the schedule started pulling the ASX too: an AU
+    refresh would have read the US row, believed itself fresh, and skipped the session."""
+    assert refresh.bulk_request_type("AU") == "/eod-bulk-last-day/AU"
+    assert refresh.is_fresh(FakeStore(pulls=1), "AU") is True
 
 
 # ---------------------------------------------------------------------------

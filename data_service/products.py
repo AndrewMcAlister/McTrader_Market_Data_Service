@@ -388,6 +388,21 @@ class Products:
 
             return {s: self._bulk_snapshot[s] for s in symbols if s in self._bulk_snapshot}
 
+    def refresh_snapshot(self, venue: str = "US") -> int:
+        """Collect the whole-market snapshot now and cache every usable row.
+
+        Called by the schedule at session open + 45. Unlike ``prices()`` this will not
+        accept the in-memory copy: the point is a collection at a known instant, so the
+        120-second snapshot is discarded first and the vendor is asked again.
+
+        Returns the number of rows written to SymbolPriceCache -- zero when the venue has
+        no whole-market feed (EODHD has one for the US only), which the caller reports.
+        """
+        with self._bulk_lock:
+            self._bulk_fetched_at = None
+        self._bulk_quotes([], venue)
+        return len(self._bulk_snapshot)
+
     # ------------------------------------------------------------------
     # bars
     # ------------------------------------------------------------------

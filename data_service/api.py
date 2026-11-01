@@ -151,6 +151,68 @@ def build_products(settings: config_module.Settings, store: Store) -> Any:
         return None
 
 
+def _build_schedule(app: FastAPI, settings: Any):
+    """The collection schedule, wired to the same store and vendor client as the endpoints.
+
+    Returns None when the product layer is unavailable: a service without a vendor client
+    can still serve the clock and the cache, and a scheduler that cannot collect should not
+    be started pretending it will.
+    """
+    from .clock import clock as market_clock
+    from .refresh import refresh_daily_bars
+    from .schedule import MARKETS, RefreshScheduler, SessionSchedule
+
+    products = getattr(app.state, "products", None)
+    if products is None:
+        return None
+
+    store = app.state.store
+    windows = {window.market: window for window in MARKETS}
+    session_schedule = SessionSchedule(
+        market_clock(),
+        offset_minutes=settings.schedule_offset_minutes,
+        retry_minutes=settings.schedule_retry_minutes)
+
+    def run_market(market: str) -> Dict[str, Any]:
+        """Collect one venue's bulk data -- but only while that venue is open.
+
+        The guard is here, at the point of collection, and not only on the schedule: a
+        manual /schedule/run must obey the same rule or the rule is decorative. The bars
+        this writes are the previous session's settled bar (a bulk daily endpoint cannot
+        answer with a bar that has not closed); the snapshot it writes is live, which is
+        exactly the data the session guard exists to protect.
+        """
+        window = windows.get(market)
+        if window is None:
+            return {"ok": False, "status": "unknown-market", "market": market,
+                    "detail": f"market must be one of {sorted(windows)}"}
+        if not session_schedule.in_session(window):
+            return {"ok": False, "status": "closed", "market": market,
+                    "detail": "the venue is not open; nothing was collected"}
+
+        daily = refresh_daily_bars(
+            store=store, client=products.client, settings=settings,
+            market=market, force=False, include_indicators=True)
+        result: Dict[str, Any] = {"market": market, "daily": daily,
+                                  "status": str(daily.get("status") or "unknown")}
+        result["ok"] = result["status"] in ("refreshed", "already-fresh")
+
+        if market == "US":
+            # The whole-market snapshot: the only endpoint EODHD publishes one for. Rows
+            # land in SymbolPriceCache, which is what the books read a price from.
+            try:
+                result["snapshot_rows"] = products.refresh_snapshot("US")
+            except Exception as exc:  # noqa: BLE001 - a snapshot failure is reported, not fatal
+                result["snapshot_error"] = f"{type(exc).__name__}: {exc}"
+        return result
+
+    return RefreshScheduler(
+        schedule=session_schedule,
+        run_market=run_market,
+        retry_minutes=settings.schedule_retry_minutes,
+        offset_minutes=settings.schedule_offset_minutes)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Build the Products singleton and make sure the schema exists."""
@@ -167,10 +229,19 @@ async def lifespan(app: FastAPI):
     except Exception as exc:  # noqa: BLE001 - a schema failure must be visible, not fatal
         log.error("schema ensure failed: %s", exc)
     app.state.products = build_products(settings, app.state.store)
+
+    # The schedule: collect the whole market at each venue's open + 45, one retry, then a
+    # person. Built here because it needs the same Products singleton the endpoints use,
+    # and started as a daemon so a stuck tick cannot hold the process open.
+    app.state.schedule = _build_schedule(app, settings)
+    if app.state.schedule is not None and settings.schedule_enabled:
+        app.state.schedule.start()
     log.info(
         "McTrader_Market_Data_Service %s ready: db=%s port=%s",
         __version__, settings.db_database, settings.port)
     yield
+    if getattr(app.state, "schedule", None) is not None:
+        app.state.schedule.stop()
 
 
 def create_app() -> FastAPI:
@@ -406,6 +477,47 @@ def create_app() -> FastAPI:
     # service's own copy of the reference data (data/clock.json). GET /market/clock returns
     # the same payload McTrader's GET /trading_sessions returns, field for field, so the
     # books can switch by changing a URL rather than a response parser.
+
+    @app.get("/schedule", tags=["market clock"])
+    def get_schedule(request: Request) -> Any:
+        """What the collection schedule is, and what it did today.
+
+        Per market: whether the venue is open, the session's open/close, the fire time
+        (open + 45), the next fire, and the attempts made this session. ``state`` is
+        ``done``, ``waiting`` or ``manual-intervention`` -- the last one means two attempts
+        failed and the service has stopped trying, by design.
+        """
+        _attribute(request, "http:/schedule")
+        scheduler = getattr(request.app.state, "schedule", None)
+        if scheduler is None:
+            return JSONResponse(status_code=503, content={
+                "error": "no schedule: the product layer is unavailable"})
+        payload = scheduler.status()
+        payload["offset_minutes"] = request.app.state.settings.schedule_offset_minutes
+        payload["retry_minutes"] = request.app.state.settings.schedule_retry_minutes
+        return payload
+
+    @app.post("/schedule/run", tags=["market clock"])
+    def post_schedule_run(
+        request: Request,
+        market: str = Query("US", description="US or AU"),
+    ) -> Any:
+        """Run one market's collection now -- still only while that venue is open.
+
+        A person asking is not a reason to collect an out-of-hours price: this shares the
+        session guard with the scheduler and answers 409 ``closed`` outside the session.
+        It does not touch the attempt count, so a manual run does not consume the retry.
+        """
+        denied = _admin_guard(request)
+        if denied is not None:
+            return denied
+        _attribute(request, "http:/schedule/run")
+        scheduler = getattr(request.app.state, "schedule", None)
+        if scheduler is None:
+            return JSONResponse(status_code=503, content={
+                "error": "no schedule: the product layer is unavailable"})
+        result = scheduler.run_market(market.upper())
+        return JSONResponse(status_code=200 if result.get("ok") else 409, content=result)
 
     @app.get("/market/clock", tags=["market clock"])
     def get_market_clock(

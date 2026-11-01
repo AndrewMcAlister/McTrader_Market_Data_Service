@@ -42,19 +42,26 @@ log = logging.getLogger(__name__)
 #: One refresh at a time, process-wide.
 _LOCK = threading.Lock()
 
-#: The request type whose presence today means the bulk pull has already run.
-BULK_REQUEST_TYPE = "/eod-bulk-last-day/US"
+def bulk_request_type(market: str = "US") -> str:
+    """The ledger row that means "a bulk pull for THIS market already ran today".
+
+    Per market, and that is a fix rather than a nicety: the type was hard-coded to /US, so
+    once the schedule started pulling the ASX at its own open + 45, an AU refresh would
+    have consulted the US row -- reading "fresh" because New York had pulled, and skipping
+    the ASX session entirely (or the reverse, spending 100 units for nothing).
+    """
+    return f"/eod-bulk-last-day/{str(market).upper()}"
 
 
-def is_fresh(store: Store) -> bool:
-    """True when a bulk pull is already recorded for today, from the spend ledger.
+def is_fresh(store: Store, market: str = "US") -> bool:
+    """True when a bulk pull for ``market`` is already recorded for today, per the ledger.
 
     The ledger is the right source and MAX(SnapshotDate) is not: single-symbol rows written by
     ``/bars`` land in DailySnapshot with today's date, so the newest session can be today while the
     market-wide pull has not run for weeks.
     """
     try:
-        return store.bulk_pull_count(BULK_REQUEST_TYPE) > 0
+        return store.bulk_pull_count(bulk_request_type(market)) > 0
     except Exception as exc:  # noqa: BLE001 - an unreadable ledger means "do not assume fresh"
         log.warning("could not read the ledger for freshness (%s); treating as stale", exc)
         return False
@@ -85,9 +92,9 @@ def refresh_daily_bars(
 
     # `force` and an explicit session both bypass the freshness check: the first is a person saying
     # "do it anyway", the second is asking for a session the ledger cannot vouch for.
-    if not force and session_date is None and is_fresh(store):
+    if not force and session_date is None and is_fresh(store, market):
         return {"status": "already-fresh",
-                "detail": f"a {BULK_REQUEST_TYPE} pull is already recorded today; "
+                "detail": f"a {bulk_request_type(market)} pull is already recorded today; "
                           f"pass force=true to pull again",
                 "units": 0}
 

@@ -118,6 +118,17 @@ class Settings:
     #: has to read it the same way or the same query would mean two different instants.
     clock_user_timezone: str = "Australia/Sydney"
 
+    # -- the refresh schedule ----------------------------------------------
+    #: Collect the whole market at session open + this many minutes, per venue. 45 is the
+    #: window the books rank in, and it is late enough that the vendor's own feed has
+    #: caught up with the open.
+    schedule_offset_minutes: int = 45
+    #: One retry this many minutes after the first attempt, then a person. Still inside
+    #: the session, which is the only window the data is worth collecting in.
+    schedule_retry_minutes: int = 15
+    #: Off means the service stops collecting on its own and waits for /schedule/run.
+    schedule_enabled: bool = True
+
     @property
     def connection_string(self) -> str:
         """The pyodbc connection string, assembled from the fields above."""
@@ -199,4 +210,7 @@ def load(api_key: Optional[str] = None) -> Settings:
         host=_env("MDS_HOST", "127.0.0.1"),
         port=_env_int("MDS_PORT", 8003),
         clock_user_timezone=_env("MDS_CLOCK_USER_TIMEZONE", "Australia/Sydney"),
+        schedule_offset_minutes=_env_int("MDS_SCHEDULE_OFFSET_MINUTES", 45),
+        schedule_retry_minutes=_env_int("MDS_SCHEDULE_RETRY_MINUTES", 15),
+        schedule_enabled=_env("MDS_SCHEDULE_ENABLED", "1") not in ("0", "false", "False"),
     )
