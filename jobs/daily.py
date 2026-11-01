@@ -49,10 +49,13 @@ log = logging.getLogger("data_service.daily")
 # vendor pull
 # ---------------------------------------------------------------------------
 
-def _row_from_bulk(raw: Dict[str, Any], session_date: date,
-                   symbol: Optional[str] = None,
-                   market: str = "US") -> Optional[Dict[str, Any]]:
-    """One bulk row as a DailySnapshot row, preferring adjusted_close."""
+def _row_from_bulk(raw: Dict[str, Any], session_date: date, market: str,
+                   symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """One bulk row as a DailySnapshot row, preferring adjusted_close.
+
+    ``market`` has no default: this is the function that stamps the venue, and a default
+    here would file an ASX pull as US without anyone deciding to.
+    """
     code = symbol or bare_symbol(str(raw.get("code") or ""))
     if not code:
         return None
@@ -134,7 +137,7 @@ def pull_bulk(store: Store, client: EodhdClient, market: str = "US",
         unadjusted = 0
         for raw in rows:
             symbol = bare_symbol(str(raw.get("code") or ""))
-            row = _row_from_bulk(raw, session_date, symbol, market)
+            row = _row_from_bulk(raw, session_date, market=market, symbol=symbol)
             if row is None:
                 continue
             if not row["adjusted"]:

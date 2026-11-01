@@ -36,6 +36,10 @@
  * listing and a US one, and a symbol-only key lets one venue's row overwrite the other's
  * without a word.
  *
+ * The venue has no default, on any of the three tables. A row filed under the wrong venue
+ * is indistinguishable from a right one, so the database does not invent one: every writer
+ * must state it, and a write that does not is refused rather than filed as US.
+ *
  * IsAdjusted exists because the warehouse already carries both conventions and documents
  * the trap: BarReal5Min is NOT split-adjusted while BarHourly is, and a split shows as a
  * jump (JDZG, 2026-03-23: $0.0928 against $20.925 the same day). An ATR mixing the two
@@ -61,7 +65,7 @@ IF OBJECT_ID('dbo.SymbolPriceCache', 'U') IS NULL
 BEGIN
     CREATE TABLE dbo.SymbolPriceCache (
         SymbolCode     varchar(24)   NOT NULL,
-        Venue          varchar(8)    NOT NULL CONSTRAINT DF_SymbolPriceCache_Venue DEFAULT ('US'),
+        Venue          varchar(8)    NOT NULL,
         Price          decimal(18,6) NOT NULL,
         Bid            decimal(18,6) NULL,
         Ask            decimal(18,6) NULL,
@@ -96,7 +100,7 @@ IF OBJECT_ID('dbo.DailySnapshot', 'U') IS NULL
 BEGIN
     CREATE TABLE dbo.DailySnapshot (
         SymbolCode   varchar(24)   NOT NULL,
-        Exchange     varchar(8)    NOT NULL CONSTRAINT DF_DailySnapshot_Exchange DEFAULT ('US'),
+        Exchange     varchar(8)    NOT NULL,
         SnapshotDate date          NOT NULL,
         [Open]       decimal(18,6) NOT NULL,
         [High]       decimal(18,6) NOT NULL,
@@ -123,7 +127,7 @@ IF OBJECT_ID('dbo.IndicatorCache', 'U') IS NULL
 BEGIN
     CREATE TABLE dbo.IndicatorCache (
         SymbolCode     varchar(24)   NOT NULL,
-        Exchange       varchar(8)    NOT NULL CONSTRAINT DF_IndicatorCache_Exchange DEFAULT ('US'),
+        Exchange       varchar(8)    NOT NULL,
         Atr14          decimal(18,6) NULL,
         Atr20          decimal(18,6) NULL,
         Atr22          decimal(18,6) NULL,
@@ -333,6 +337,29 @@ BEGIN
     ALTER TABLE dbo.IndicatorCache ADD CONSTRAINT PK_IndicatorCache
         PRIMARY KEY CLUSTERED (SymbolCode, Exchange);
 END
+GO
+
+/* The column is added with a temporary default because SQL Server needs one to fill the
+   rows that already exist. It does not stay. A default turns "this writer forgot the venue"
+   into "this row is US" -- a claim the writer never made, and the exact silent mislabel the
+   key exists to prevent. After this, a write without a venue fails instead. */
+
+IF EXISTS (SELECT 1 FROM sys.default_constraints
+            WHERE name = 'DF_DailySnapshot_Exchange'
+              AND parent_object_id = OBJECT_ID('dbo.DailySnapshot'))
+    ALTER TABLE dbo.DailySnapshot DROP CONSTRAINT DF_DailySnapshot_Exchange;
+GO
+
+IF EXISTS (SELECT 1 FROM sys.default_constraints
+            WHERE name = 'DF_IndicatorCache_Exchange'
+              AND parent_object_id = OBJECT_ID('dbo.IndicatorCache'))
+    ALTER TABLE dbo.IndicatorCache DROP CONSTRAINT DF_IndicatorCache_Exchange;
+GO
+
+IF EXISTS (SELECT 1 FROM sys.default_constraints
+            WHERE name = 'DF_SymbolPriceCache_Venue'
+              AND parent_object_id = OBJECT_ID('dbo.SymbolPriceCache'))
+    ALTER TABLE dbo.SymbolPriceCache DROP CONSTRAINT DF_SymbolPriceCache_Venue;
 GO
 
 /* The documentation follows the change. A grain that changed has to say so, or the next

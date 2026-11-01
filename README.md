@@ -299,6 +299,10 @@ Notes that are load-bearing:
   `IndicatorCache` is `(SymbolCode, Exchange)`, so every read and write states the venue.
   `SymbolPriceCache` calls the same code `Venue` because it got there first; both columns hold
   the vendor's exchange code (`US`, `AU`, ...).
+- **A write always states its venue.** The three columns are `NOT NULL` and carry no default,
+  at either layer: the store raises before it builds a row, and SQL Server refuses one that
+  arrives without a value. A row is never filed as US by omission. The only place US is
+  assumed is a request that does not name a venue, which is the API's documented default.
 - **Rows written before 2026-11-01 were backfilled** from the price cache: US, unless that
   symbol was known on the ASX and nowhere else. That reassigned 18,363 rows that had been AU
   all along and were indistinguishable from US ones.

@@ -67,19 +67,23 @@ CREATE TABLE #stage (
 """
 
 def _exchange_key(value: Any, *, required: bool = False) -> str:
-    """The Exchange column's value for a venue: an upper-case market code.
+    """The Exchange (or Venue) column's value for a venue: an upper-case market code.
 
     A read defaults to US, which is what a caller that says nothing about its venue means
-    and what the API itself defaults to. A write passes ``required=True``: a bar whose venue
-    was forgotten is not a US bar, it is an unknown one -- and defaulting it is exactly how
+    and what the API itself defaults to. A write passes ``required=True``: a row whose venue
+    was forgotten is not a US row, it is an unknown one -- and defaulting it is exactly how
     an ASX session came to be filed as US in the first place.
+
+    The tables have no default for this column either, so a writer that bypasses this module
+    is refused by the database rather than filed as US. The rule is the same at both layers:
+    a venue is something a writer states, never something it inherits.
     """
     text = str(value or "").strip().upper()
     if text:
         return text
     if required:
         raise ValueError(
-            "a bar row must carry its exchange; refusing to file an unknown venue as US")
+            "a row must state its venue (Exchange); refusing to file an unknown venue as US")
     return "US"
 
 
@@ -289,10 +293,15 @@ class Store:
         return out
 
     def upsert_prices(self, rows: Iterable[Dict[str, Any]]) -> int:
-        """Write price rows. Returns the count attempted."""
+        """Write price rows. Returns the count attempted.
+
+        The venue is required, not defaulted: the key is (symbol, venue), so a row without
+        one would overwrite another venue's price rather than create its own.
+        """
         payload = [
             (
-                r["symbol"], r["venue"], r["price"], r.get("bid"), r.get("ask"),
+                r["symbol"], _exchange_key(r.get("venue"), required=True), r["price"],
+                r.get("bid"), r.get("ask"),
                 r.get("previous_close"), r.get("change_pct"), r.get("volume"),
                 r.get("as_of"), r.get("fetched_at") or _now_utc(),
                 r.get("provider") or "eodhd",

@@ -158,7 +158,7 @@ def test_upsert_daily_refuses_a_row_that_forgot_its_venue():
     row = row_for_daily()
     del row["exchange"]
 
-    with pytest.raises(ValueError, match="exchange"):
+    with pytest.raises(ValueError, match="venue"):
         store.upsert_daily([row])
 
 
@@ -241,3 +241,39 @@ def test_a_read_with_no_venue_means_us():
     store.get_daily_bars_many(["msft"], 15)
 
     assert connection.executed[0][1][0] == "US"
+
+
+# ---------------------------------------------------------------------------
+# every write states its venue: no row is filed as US by omission
+# ---------------------------------------------------------------------------
+
+def test_upsert_indicators_refuses_a_row_that_forgot_its_venue():
+    store = store_against(FakeConnection())
+
+    with pytest.raises(ValueError, match="venue"):
+        store.upsert_indicators([{
+            "symbol": "CBA",
+            "values": {14: 1.0},
+            "reference_price": 100.5, "sessions_used": 30,
+            "as_of_session": "2026-10-30", "method": "tr", "smoothing": "simple",
+        }])
+
+
+def test_upsert_prices_refuses_a_row_that_forgot_its_venue():
+    """(symbol, venue) is the key: a venue-less row would overwrite another venue's price."""
+    store = store_against(FakeConnection())
+
+    with pytest.raises(ValueError, match="venue"):
+        store.upsert_prices([{"symbol": "AAPL", "price": 231.4}])
+
+
+def test_the_database_does_not_default_the_venue():
+    """The second line of defence: with no DEFAULT, a write that bypasses this module and
+    omits the venue is refused by SQL Server instead of being filed as US."""
+    text = (Path(__file__).resolve().parent.parent / "sql" / "001_schema.sql").read_text(
+        encoding="utf-8")
+    venue_columns = [line.strip() for line in text.splitlines()
+                     if line.strip().startswith(("Exchange ", "Venue "))]
+    assert len(venue_columns) == 3, f"expected three venue columns, found {venue_columns}"
+    for line in venue_columns:
+        assert "DEFAULT" not in line.upper(), f"the venue is defaulted: {line}"
