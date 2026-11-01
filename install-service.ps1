@@ -191,6 +191,15 @@ if ($Install) {
             Write-Host "  removing scheduled task $taskName"
             Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
         }
+
+        # The watchdog exists because the boot-only task had no crash recovery: it starts the
+        # service when port 8003 is closed. NSSM already restarts a dead child, so leaving it
+        # registered would race SCM recovery for the port -- remove it with the task.
+        $watchdog = 'McTrader_Market_Data_Service_Watchdog'
+        if (Get-ScheduledTask -TaskName $watchdog -ErrorAction SilentlyContinue) {
+            Write-Host "  removing scheduled task $watchdog (NSSM does the restarting now)"
+            Unregister-ScheduledTask -TaskName $watchdog -Confirm:$false
+        }
         $listening = @(Get-NetTCPConnection -LocalPort 8003 -State Listen -ErrorAction SilentlyContinue)
         foreach ($connection in $listening) {
             Write-Host "  stopping pid $($connection.OwningProcess) holding port 8003"

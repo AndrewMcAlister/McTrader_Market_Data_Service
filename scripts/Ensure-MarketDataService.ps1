@@ -32,7 +32,11 @@ param(
     [int]$WaitSeconds = 45,
     [int]$MaxStartsPerHour = 30,
     [switch]$Stop,
-    [switch]$Restart
+    [switch]$Restart,
+    #: The watchdog's mode: start it when nothing is listening and otherwise do NOTHING.
+    #: A bare run is a restart (it stops whatever holds the port), so a repeating task
+    #: must use this switch or it would tear the service down every ten minutes.
+    [switch]$StartIfAbsent
 )
 
 $ErrorActionPreference = 'Stop'
@@ -74,6 +78,13 @@ function Get-RecentStarts {
     }
     return $count
 }
+
+# Watchdog mode: nothing listening means start it; anything listening means leave it
+# alone. Checked BEFORE the first Note(), because a run that has nothing to do must
+# leave no trace -- a ten-minute task would otherwise write 144 log files and 144
+# history lines a day, and bury the one that matters. With the port free there is
+# nothing for the stop block below to stop, so the normal start path is safe as-is.
+if ($StartIfAbsent -and (Test-Port $Port)) { exit 0 }
 
 Note "ensure: port=$Port pid=$PID"
 
