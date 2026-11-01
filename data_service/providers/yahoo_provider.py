@@ -192,6 +192,9 @@ class YahooProvider:
             as_of=as_of,
             currency=meta.get("currency") or venue_currency_code(symbol, venue),
             raw_ticker=ticker,
+            # Volume from the same meta block as the price, so a mover list has the traded
+            # size for indices and FX too, not just for the venues EODHD prices.
+            volume=int(_number(meta.get("regularMarketVolume")) or 0),
         )
 
     def bars(self, symbol: str, asset_class: str = SHARES, sessions: int = 60,

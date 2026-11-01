@@ -193,6 +193,11 @@ class Products:
             "ask": None,
             "previous_close": quote.previous_close,
             "change_pct": quote.change_pct,
+            # Volume is what makes a mover a mover: a name up 30% on 4,000 shares is a
+            # different event from one up 30% on four million, and until 2026-11-01 the
+            # cache threw the field away. getattr, because a quote from a caller's own
+            # adapter may not carry it and an absent volume is 0, not an error.
+            "volume": int(getattr(quote, "volume", 0) or 0),
             "as_of": quote.as_of,
             "fetched_at": fetched_at,
             # Which provider answered. Carried into the cache and out again so a caller can

@@ -58,18 +58,21 @@ CREATE TABLE #stage (
 _MERGE_PRICE = """
 MERGE dbo.SymbolPriceCache AS target
 USING (SELECT ? AS SymbolCode, ? AS Venue, ? AS Price, ? AS Bid, ? AS Ask,
-              ? AS PreviousClose, ? AS ChangePct, ? AS AsOfUtc, ? AS LastUpdatedUtc,
-              ? AS Source) AS source
+              ? AS PreviousClose, ? AS ChangePct, ? AS Volume, ? AS AsOfUtc,
+              ? AS LastUpdatedUtc, ? AS Source) AS source
     ON target.SymbolCode = source.SymbolCode AND target.Venue = source.Venue
 WHEN MATCHED THEN UPDATE SET
     Price = source.Price, Bid = source.Bid, Ask = source.Ask,
     PreviousClose = source.PreviousClose, ChangePct = source.ChangePct,
+    Volume = source.Volume,
     AsOfUtc = source.AsOfUtc, LastUpdatedUtc = source.LastUpdatedUtc, Source = source.Source
 WHEN NOT MATCHED THEN INSERT
-    (SymbolCode, Venue, Price, Bid, Ask, PreviousClose, ChangePct, AsOfUtc, LastUpdatedUtc, Source)
+    (SymbolCode, Venue, Price, Bid, Ask, PreviousClose, ChangePct, Volume, AsOfUtc,
+     LastUpdatedUtc, Source)
 VALUES
     (source.SymbolCode, source.Venue, source.Price, source.Bid, source.Ask,
-     source.PreviousClose, source.ChangePct, source.AsOfUtc, source.LastUpdatedUtc, source.Source);
+     source.PreviousClose, source.ChangePct, source.Volume, source.AsOfUtc,
+     source.LastUpdatedUtc, source.Source);
 """
 
 _MERGE_DAILY = """
@@ -278,8 +281,9 @@ class Store:
         payload = [
             (
                 r["symbol"], r["venue"], r["price"], r.get("bid"), r.get("ask"),
-                r.get("previous_close"), r.get("change_pct"), r.get("as_of"),
-                r.get("fetched_at") or _now_utc(), r.get("provider") or "eodhd",
+                r.get("previous_close"), r.get("change_pct"), r.get("volume"),
+                r.get("as_of"), r.get("fetched_at") or _now_utc(),
+                r.get("provider") or "eodhd",
             )
             for r in rows
         ]
@@ -558,6 +562,55 @@ class Store:
         finally:
             conn.close()
 
+    def big_movers(self, venue: str, limit: int = 25, min_price: float = 1.0,
+                   min_dollar_volume: float = 0.0) -> Dict[str, List[Dict[str, Any]]]:
+        """The venue's winners and losers by percent, from the price cache.
+
+        Ranked by percent, floored by price and dollar volume, because a 300% move on
+        4,000 shares is noise; a caller that wants pure percent passes zero floors.
+        ``volume`` is the provider's latest cumulative volume, so a row collected at 10:15
+        carries the volume traded up to 10:15 -- which is what "latest volume" means here.
+
+        Returns ``{"winners": [...], "losers": [...]}``. The caller decides whether the
+        data is current enough to serve; this method only answers what is in the cache.
+        """
+        limit = max(0, int(limit))
+        sql = """
+            SELECT TOP (?)
+                   SymbolCode, Price, ChangePct, Volume, PreviousClose, AsOfUtc,
+                   Source, CAST(Price * Volume AS decimal(38, 2)) AS DollarVolume
+              FROM dbo.SymbolPriceCache
+             WHERE Venue = ?
+               AND Price >= ?
+               AND ChangePct IS NOT NULL
+               AND Volume IS NOT NULL AND Volume > 0
+               AND Price * Volume >= ?
+               AND ChangePct {direction} 0
+          ORDER BY ChangePct {order}
+        """
+        out: Dict[str, List[Dict[str, Any]]] = {"winners": [], "losers": []}
+        conn = self.connect()
+        try:
+            cursor = conn.cursor()
+            for key, direction, order in (("winners", ">=", "DESC"),
+                                          ("losers", "<", "ASC")):
+                cursor.execute(sql.format(direction=direction, order=order),
+                               limit, venue, float(min_price), float(min_dollar_volume))
+                for row in cursor.fetchall():
+                    out[key].append({
+                        "symbol": row[0],
+                        "price": float(row[1]),
+                        "change_pct": float(row[2]),
+                        "volume": int(row[3]),
+                        "previous_close": float(row[4]) if row[4] is not None else None,
+                        "as_of_utc": row[5],
+                        "source": row[6],
+                        "dollar_volume": float(row[7]) if row[7] is not None else None,
+                    })
+        finally:
+            conn.close()
+        return out
+
     def latest_venue_price(self, venue: str) -> Optional[datetime]:
         """The observation time of the newest price stored for ``venue``.
 
@@ -686,3 +739,4 @@ class Store:
             "latest_session": row[4].isoformat() if row[4] else None,
             "latest_price_at": row[5].isoformat() if row[5] else None,
         }
+

@@ -700,6 +700,116 @@ def create_app() -> FastAPI:
             "X-Session-Is-Open": "true" if result.session_is_open else "false",
         })
 
+    @app.get("/todays-big-movers", tags=["market data"])
+    def get_todays_big_movers(
+        request: Request,
+        country_code: str = Query("US", description="us/US or au/AU"),
+        limit: int = Query(25, ge=1, le=200, description="how many winners and losers"),
+        min_price: float = Query(1.0, ge=0.0, description="ignore anything cheaper"),
+        min_dollar_volume: float = Query(
+            0.0, ge=0.0,
+            description="ignore anything that traded less than this (price x volume)"),
+    ) -> Any:
+        """Today's biggest winners and losers for a country, if today's data is in.
+
+        Two lists, each entry shaped::
+
+            {"symbol": "ADT", "price": 9.86, "change_pct": 6.31, "volume": 163754638,
+             "dollar_volume": 1614620730.68, "previous_close": 9.27,
+             "as_of_utc": "2026-10-30T19:31:00+00:00", "source": "eodhd",
+             "market_cap": null}
+
+        Gated on the same rule as ``GET /todays-data-is-available``, because a mover list
+        built from yesterday's prices is the most misleading thing this service could
+        serve -- it looks live. When the gate is false the answer is a 200 with
+        ``available: false``, a reason, and empty lists: a caller branches on one field and
+        never has to treat "no data yet" as an error.
+
+        ``change_pct`` is the provider's own, computed against the previous close that was
+        observed with the price, so a split or a stale previous close shows up as the
+        vendor reports it rather than as this service's guess.
+
+        MARKET CAP is not available at market scale from this vendor: EODHD's bulk feed
+        carries no capitalisation, and per-symbol fundamentals cost 10 units each (about
+        28,000 for one US scan). The field is present and null so a caller can rely on the
+        shape today and gain the value later without a parser change.
+        """
+        _attribute(request, "http:/todays-big-movers")
+        from .availability import COUNTRIES, _as_utc, check, country_key
+        from .clock import clock
+
+        try:
+            country = country_key(country_code)
+        except KeyError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
+
+        store = request.app.state.store
+        venue = COUNTRIES[country][0]
+        try:
+            latest = store.latest_venue_price(venue)
+        except Exception as exc:  # noqa: BLE001 - an unreadable store cannot vouch for data
+            log.warning("todays-big-movers: could not read the price cache (%s)", exc)
+            latest = None
+
+        availability = check(clock(), latest, country)
+        session = {
+            "open_utc": availability.session_open_utc.isoformat() if availability.session_open_utc else None,
+            "close_utc": availability.session_close_utc.isoformat() if availability.session_close_utc else None,
+            "is_open": availability.session_is_open,
+        }
+        if not availability.available:
+            return JSONResponse(status_code=200, content={
+                "available": False,
+                "reason": ("no price for this venue was observed at or after its most "
+                           "recent session open"),
+                "country": country,
+                "venue": venue,
+                "session": session,
+                "latest_price_utc": availability.latest_utc.isoformat() if availability.latest_utc else None,
+                "winners": [],
+                "losers": [],
+            })
+
+        try:
+            movers = store.big_movers(venue, limit=limit, min_price=min_price,
+                                      min_dollar_volume=min_dollar_volume)
+        except Exception as exc:  # noqa: BLE001 - a broken query is a 503, not a 200 with no rows
+            log.exception("todays-big-movers: query failed")
+            return JSONResponse(status_code=503,
+                                content={"error": "could not read the price cache",
+                                         "detail": f"{type(exc).__name__}: {exc}"})
+
+        def shape(rows: list) -> list:
+            out = []
+            for row in rows:
+                observed = _as_utc(row.get("as_of_utc"))
+                out.append({
+                    "symbol": row["symbol"],
+                    "price": row["price"],
+                    "change_pct": row["change_pct"],
+                    "volume": row["volume"],
+                    "dollar_volume": row["dollar_volume"],
+                    "previous_close": row["previous_close"],
+                    "as_of_utc": observed.isoformat() if observed else None,
+                    "source": row["source"],
+                    "market_cap": None,
+                })
+            return out
+
+        return JSONResponse(status_code=200, content={
+            "available": True,
+            "country": country,
+            "venue": venue,
+            "session": session,
+            "latest_price_utc": availability.latest_utc.isoformat() if availability.latest_utc else None,
+            "filters": {"limit": limit, "min_price": min_price,
+                        "min_dollar_volume": min_dollar_volume},
+            "counts": {"winners": len(movers["winners"]), "losers": len(movers["losers"])},
+            "market_cap_source": None,
+            "winners": shape(movers["winners"]),
+            "losers": shape(movers["losers"]),
+        })
+
     def _clock_reference_instant(time: Optional[str] = None, at: Optional[str] = None):
         """The instant to resolve against: an ISO stamp, an HH:MM today in UTC, or now."""
         from datetime import datetime, time as clock_time, timezone

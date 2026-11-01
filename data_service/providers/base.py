@@ -63,6 +63,11 @@ class ProviderQuote:
     as_of: Optional[datetime] = None
     currency: Optional[str] = None
     raw_ticker: Optional[str] = None
+    #: Volume traded so far in the session, when the provider sends one. It belongs on the
+    #: quote because a mover is only a mover relative to how much actually traded, and it
+    #: was missing until 2026-11-01: every cached price carried volume 0, so a movers query
+    #: that requires volume > 0 could only ever answer "nothing moved".
+    volume: Optional[int] = None
 
     @property
     def change_pct(self) -> Optional[float]:

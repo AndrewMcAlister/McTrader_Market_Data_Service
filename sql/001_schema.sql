@@ -65,6 +65,7 @@ BEGIN
         Ask            decimal(18,6) NULL,
         PreviousClose  decimal(18,6) NULL,
         ChangePct      decimal(10,4) NULL,
+        Volume         bigint        NULL,
         AsOfUtc        datetime2     NULL,
         LastUpdatedUtc datetime2     NOT NULL,
         Source         varchar(16)   NOT NULL,
@@ -76,6 +77,14 @@ BEGIN
     CREATE NONCLUSTERED INDEX IX_SymbolPriceCache_Updated
         ON dbo.SymbolPriceCache (LastUpdatedUtc) INCLUDE (Price, PreviousClose);
 END
+GO
+
+/* Volume arrived with todays-big-movers (2026-11-01): the providers were already
+   returning it and the cache was throwing it away, so a mover could be ranked by
+   percent and not by how much was actually traded. Guarded, so an existing database
+   gains the column on the next start and a fresh one gets it from the CREATE above. */
+IF COL_LENGTH('dbo.SymbolPriceCache', 'Volume') IS NULL
+    ALTER TABLE dbo.SymbolPriceCache ADD Volume bigint NULL;
 GO
 
 /* ------------------------------------------------------------------ */

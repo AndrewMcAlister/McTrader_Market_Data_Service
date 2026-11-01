@@ -145,6 +145,9 @@ class BinanceProvider:
             as_of=as_of,
             currency="USDT" if pair.endswith("USDT") else None,
             raw_ticker=pair,
+            # 24h quote volume: crypto trades around the clock, so this is the window the
+            # price move is measured over and the only volume that means the same thing.
+            volume=int(_number(payload.get("volume")) or 0),
         )
 
     def bars(self, symbol: str, asset_class: str = CRYPTO, sessions: int = 60,

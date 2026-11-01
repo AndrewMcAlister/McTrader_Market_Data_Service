@@ -96,6 +96,7 @@ class EodhdProvider:
             as_of=_epoch(payload.get("timestamp")),
             currency=payload.get("currency") or venue_currency_code(symbol, venue),
             raw_ticker=ticker,
+            volume=int(_number(payload.get("volume")) or 0),
         )
 
     def bars(self, symbol: str, asset_class: str = SHARES, sessions: int = 60,
@@ -177,6 +178,11 @@ class EodhdProvider:
                 provider=self.name,
                 previous_close=_number(row.get("previousClose")),
                 as_of=_epoch(row.get("timestamp")),
+                # The whole-market row carries volume, and dropping it here is what made
+                # todays-big-movers return nothing: the cache stored volume 0 for every
+                # US name, and the query requires volume > 0. The field costs nothing --
+                # it is already in the payload -- so it is carried through.
+                volume=int(_number(row.get("volume")) or 0),
                 currency="USD" if market == "US" else None,
                 raw_ticker=f"{code}.{market}",
             ))
