@@ -4,36 +4,43 @@ REM ============================================================================
 REM  Stop McTrader_Market_Data_Service.
 REM ============================================================================
 REM
-REM  Asks the service to stop itself, via POST /admin/shutdown.
+REM  THIS STOPS THE SERVICE, NOT THE PROCESS.
 REM
-REM  It does not try to kill the process, and that is not laziness: the service
-REM  runs in SESSION 0 (Task Scheduler started it) while your shell is session 2,
-REM  and a session-2 process cannot terminate a session-0 process -- "Access is
-REM  denied", at any run level. A process can always end itself, so the service
-REM  is asked to.
+REM  POST /admin/shutdown is no longer how this is done. NSSM is installed with
+REM  "AppExit Default Restart", so a child that exits -- even cleanly, even on
+REM  purpose -- is started again five seconds later. Only a service stop tells
+REM  the supervisor to stay down.
 REM
-REM  Nothing restarts it afterwards: the keep-alive task is boot-only.
+REM  WHY THIS ASKS FOR ELEVATION
 REM
-REM  If this reports "no answer", the process is not running, or it is wedged and
-REM  cannot serve HTTP. A wedged process needs the task route instead:
-REM      schtasks /run /tn "McTrader_Market_Data_Service_KeepAlive_Stop"
-REM  That task is created by install-task.ps1 -Install. It is not needed for the
-REM  normal case and stop.bat does not depend on it.
+REM  Controlling a Windows service needs SERVICE_STOP, which the filtered token
+REM  of an ordinary shell does not have: nssm itself answers "OpenService():
+REM  Access is denied" even though the account is an administrator. So this
+REM  re-runs itself behind one UAC prompt. Nothing else in the project needs it.
 REM
-REM  For scripted use:
+REM  If the child is wedged and the service will not stop, the process can still
+REM  end itself -- that is what /admin/shutdown is for:
 REM      curl -X POST http://127.0.0.1:8003/admin/shutdown
+REM  NSSM restarts it a few seconds later, which is usually the fix.
+REM
+REM  For scripted use: .\install-service.ps1 -Stop   (elevated)
 REM ============================================================================
 
+set SVC=McTrader_Market_Data_Service
 set PORT=8003
 
-echo.
-echo   Stopping McTrader_Market_Data_Service...
-echo.
+net session >nul 2>&1
+if errorlevel 1 (
+    echo.
+    echo   Stopping a Windows service needs an elevated shell -- asking for UAC now.
+    powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+    exit /b 0
+)
 
-powershell -NoProfile -Command "try { Invoke-RestMethod -Method Post 'http://127.0.0.1:%PORT%/admin/shutdown' -TimeoutSec 10 -ErrorAction Stop | Out-Null; Write-Host '   shutdown requested' } catch { Write-Host '   no answer on %PORT% -- not running, or wedged' }"
-
-REM up to 15 seconds for the port to close
-powershell -NoProfile -Command "$deadline = (Get-Date).AddSeconds(15); while ((Get-Date) -lt $deadline) { if (-not (Get-NetTCPConnection -LocalPort %PORT% -State Listen -ErrorAction SilentlyContinue)) { break }; Start-Sleep -Milliseconds 500 }; $c = Get-NetTCPConnection -LocalPort %PORT% -State Listen -ErrorAction SilentlyContinue; if ($c) { Write-Host ('   STILL LISTENING on %PORT% (pid ' + $c[0].OwningProcess + ') -- a wedged process needs the task route') } else { Write-Host '   stopped -- nothing is listening on %PORT%' }"
+echo.
+echo   Stopping %SVC%...
+sc stop %SVC% >nul
+powershell -NoProfile -Command "$s='%SVC%'; for ($i=0; $i -lt 24; $i++) { Start-Sleep -Milliseconds 500; if ((Get-Service $s).Status -eq 'Stopped') { break } }; $svc = Get-Service $s; $listen = [bool](Get-NetTCPConnection -LocalPort %PORT% -State Listen -ErrorAction SilentlyContinue); Write-Host ('   state: ' + $svc.Status + '   listening on %PORT%: ' + $listen)"
 
 echo.
 echo   Start it again with start.bat

@@ -344,19 +344,21 @@ def create_app() -> FastAPI:
     def shutdown(request: Request) -> Dict[str, Any]:
         """Stop this process, from inside this process.
 
-        Session isolation means nothing in an interactive shell can terminate it: Task Scheduler
-        starts the service in session 0, and a session-2 process gets "Access is denied" at any run
-        level. A process can always end itself, which is what makes stop.bat a plain HTTP call with
-        no elevation and no second scheduled task.
+        Session isolation means nothing in an interactive shell can terminate it: a service runs
+        in session 0, and a session-2 process gets "Access is denied" at any run level. A process
+        can always end itself, which is what makes this a usable last resort for a wedged child
+        that cannot be stopped any other way.
 
-        Logged at WARNING: stopping the sink is a decision that should leave a trace.
+        It does NOT stop the service. NSSM is installed with ``AppExit Default Restart``, so a
+        process that exits -- even cleanly -- is started again five seconds later. ``stop.bat``
+        stops the SERVICE, which is the only thing that means "stay down".
         """
         caller = request.client.host if request.client else "unknown"
         log.warning("shutdown requested via /admin/shutdown by %s", caller)
         logging.shutdown()  # flush handlers before the process goes
         threading.Timer(0.4, lambda: os._exit(0)).start()
         return {"ok": True, "stopping": True, "requested_by": caller,
-                "note": "the boot task is boot-only, so nothing restarts this; run start.bat"}
+                "note": "the supervisor restarts this within ~5s; use stop.bat to stop the service"}
 
     # -- bulk refresh ------------------------------------------------------
 

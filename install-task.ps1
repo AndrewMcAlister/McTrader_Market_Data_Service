@@ -3,6 +3,16 @@
     Register McTrader_Market_Data_Service to start at boot under YOUR account, via Task Scheduler.
 
 .DESCRIPTION
+    SUPERSEDED ON 2026-11-01 by install-service.ps1 (NSSM). The deployment is now a Windows
+    service, which the SCM starts at boot, restarts when it exits, and orders after SQL Server.
+    This script is kept for reference and for a machine without NSSM; do not run both, because a
+    task and a service would race for port 8003.
+
+    The boot-only trigger here had no recovery, and the daily refresh task it registers was never
+    actually registered on this machine: the whole-market pull stopped on 2026-10-29 and nothing
+    noticed. That is the failure the service replaces. The daily pull is now
+    McTrader_Market_Data_Service_Daily (run.ps1 -Daily, 11:30 local).
+
     This is the same shape as McTrader_AutoStart_OnBoot, with one addition taken from
     PaperTrader_KeepAlive.
 

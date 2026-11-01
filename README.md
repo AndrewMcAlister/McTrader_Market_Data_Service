@@ -571,175 +571,117 @@ one quota.
 
 ---
 
-## Starting at boot
+## Running as a service
 
-Started by **Task Scheduler**, as your interactive account — the same way McTrader is started.
+The deployment is a **Windows service**, installed with NSSM:
 
-Day to day, use the two batch files at the top of the project: `start.bat` to
-restart it with the latest code, `stop.bat` to stop it. Neither needs elevation;
-the reasons are under "Starting, stopping and restarting" below.
-
-> **`.cmd` or `.ps1` — both work.** The execution policy was `Restricted`, which refused `.ps1` files
-> outright; it is now `RemoteSigned` for the current user (`Set-ExecutionPolicy -Scope CurrentUser
-> RemoteSigned`, no elevation required), so either form runs.
->
-> The `.cmd` wrappers remain as a fallback for `cmd.exe` and for anything that runs outside your
-> profile — a scheduled task under another account, for instance, would not see a `CurrentUser`
-> setting. The task actions registered by `install-task.ps1` pass `-ExecutionPolicy Bypass` for the
-> same reason: they should not depend on a policy in someone else's registry hive.
-
-```cmd
-install-task.cmd -Status
-install-task.cmd -Install     :: from an ELEVATED prompt; it asks for your password once
-install-task.cmd -Run         :: start it now, without waiting for a trigger
-install-task.cmd -Remove
+```
+McTrader_Market_Data_Service   Running / Automatic
+  D:\McTrader_Market_Data_Service\.venv\Scripts\python.exe -m data_service.service
+  StartName: .\AndrewBot          AppExit: Restart (5s delay, 10s throttle)
+  DependOnService: MSSQLSERVER
 ```
 
-Task Scheduler stores the password; this script never writes it anywhere.
+`.\install-service.ps1 -Install -TakeOver -AsUser "$env:USERDOMAIN\$env:USERNAME"` did it: it
+installed the service, set the account, granted "Log on as a service", removed the old scheduled
+tasks that would otherwise race it for port 8003, stopped the task-launched process, and started the
+service. `-TakeOver` is what makes the switch clean; without it two launchers fight over the port
+and the loser looks like it started and then died.
 
 ### Why your account rather than LocalSystem
 
-The EODHD key lives in the Windows Credential Manager, which is **per user**. A LocalSystem service has
-its own empty vault and cannot see it, so it would start, report healthy, and fail every vendor call.
-Running as you means the keyring works and nothing else needs configuring.
+The EODHD key lives in the Windows Credential Manager, which is **per user**. A LocalSystem service
+has its own, empty vault: it starts, reports healthy, and then fails every vendor call. Running as
+you means the keyring works with nothing else configured, and `/healthz` proves it:
 
-`LogonType` is `Password`, not `S4U`, and that distinction is load-bearing: an S4U task runs under the
-account name *without loading your credential vault*, so the keyring would be unavailable even though
-the principal looks right. (This is very likely why PaperTrader keeps its key in plaintext in
-`config.json` — its task is `S4U`.)
-
-### One trigger, at boot — and what that costs
-
-The task fires **once, at boot**, the same shape as `McTrader_AutoStart_OnBoot`. This service needs
-no repeating sweep, and the launcher must not have one: it now **stops whatever holds the port before
-starting**, which is what makes running it by hand a restart. A 10-minute trigger plus a
-kill-before-start script would restart the service every ten minutes forever.
-
-That is the same reason McTrader's start script can afford to call `Stop-StaleListener`: its task is
-boot-only and runs once.
-
-**The cost is real and worth stating.** There is no watchdog. If the process dies, nothing brings it
-back until the next reboot or until someone runs the launcher:
-
-```powershell
-.\scripts\Ensure-MarketDataService.ps1
+```json
+{"status": "ok", "vendor_configured": true, "key_source": "keyring",
+ "database": "Market_Data", "database_ok": true}
 ```
 
-The estate already carries this exposure — `McTrader_AutoStart_OnBoot` is boot-only too — so this is
-consistency rather than a new risk. If you would rather have recovery than parity, a repeating
-trigger is one command away, with the caveat that the launcher would then need to go back to
-start-if-absent.
+`key_source` is the field that matters. If it reads `none`, the service cannot see the key and every
+vendor call will fail — see "The service account and SQL Server" and "Storing the vendor key at
+runtime" below, which are the LocalSystem alternative.
 
-This matters more here than for the log sink: the data service is on the critical path at 10:30, so a
-crash at 10:29 with no recovery means the scan and the stops have no data. That is the argument for
-the watchdog, and it is why the trade is written down rather than assumed.
+### Restarts
+
+NSSM is the supervisor: `AppExit Default Restart` with a 5-second delay and a 10-second throttle, so
+a crash is retried without a tight loop, and `DependOnService MSSQLSERVER` keeps the start ordered
+after the database (`ensure_schema()` runs at startup).
+
+Verified on 2026-11-01 by stopping the child deliberately through `POST /admin/shutdown`:
+
+```
+17:25:57  POST /admin/shutdown 202
+17:26:03  starting McTrader_Market_Data_Service on 127.0.0.1:8003 (pid=16852)
+17:26:03  EODHD key source: keyring
+17:26:03  McTrader_Market_Data_Service 0.1.0 ready: db=Market_Data port=8003
+```
+
+Six seconds, new pid, keyring still readable. That is the difference from the boot-only task era,
+where a dead process stayed dead until the next reboot — the reason the daily collection silently
+stopped for three days.
 
 ### Starting, stopping and restarting
 
-Two batch files at the top of the project, and neither needs elevation:
-
 ```cmd
-start.bat    :: stop whatever holds the port, then start it -- so new code is picked up
-stop.bat     :: stop it
+start.bat    :: start the service, then report state and health
+stop.bat     :: stop the service
 ```
 
-Both print what happened plus the log paths, then wait for a key. A result that flashes past in a
-closing window is how "it ran" gets mistaken for "it worked", which has cost real time on this
-project.
+Both re-run themselves behind **one UAC prompt**, because controlling a Windows service needs
+`SERVICE_START` / `SERVICE_STOP` and an ordinary shell's filtered token does not have them — `nssm`
+itself answers `OpenService(): Access is denied`. The prompt is the price of SCM management.
 
-#### Why they route through Task Scheduler and HTTP
+**`stop.bat` no longer calls `/admin/shutdown`,** and that is deliberate: NSSM restarts a child that
+exits, even a clean one, so asking the process to die would bring it back five seconds later. Only a
+service stop means "stay down". `/admin/shutdown` survives for the one case SCM cannot cover — a
+wedged child that will not serve HTTP — after which NSSM's restart is usually the fix.
 
-The service runs in **session 0**, because Task Scheduler started it. Your shell is **session 2**. A
-session-2 process cannot terminate a session-0 process — `Access is denied` — at *any* run level.
-This is session isolation, not privilege: a control process started in session 2 dies instantly, and
-the service never will.
+`.\install-service.ps1 -Status|-Start|-Stop|-Restart|-Remove` are the scripted equivalents; all but
+`-Status` need an elevated shell.
 
-| File | Route | Why |
-|---|---|---|
-| `start.bat` | `schtasks /run /tn "McTrader_Market_Data_Service_KeepAlive"` | Task Scheduler starts it in session 0, which is exactly what it is for. Starting a task that holds a stored password needs no elevation |
-| `stop.bat` | `POST /admin/shutdown` | A process can always end itself: no privilege, no session, no extra task |
+### The daily job is still a scheduled task
 
-`POST /admin/shutdown` logs a WARNING and answers 202, then the process exits. Verified:
-
-```
-stop.bat ->  shutdown requested
-             stopped -- nothing is listening on 8003
-```
-
-#### The one case this cannot handle
-
-A **wedged** process that cannot serve HTTP cannot be asked to stop. For that, `install-task.ps1
--Install` also registers a task whose only job is to run the launcher with `-Stop`:
+`McTrader_Market_Data_Service_Daily`, daily at **11:30 local**, runs `run.ps1 -Daily` →
+`jobs.daily`. It is deliberately **not** `POST /refresh`: a job that goes through the service cannot
+cover for the service being down, which is the failure it exists to survive.
 
 ```powershell
-schtasks /run /tn "McTrader_Market_Data_Service_KeepAlive_Stop"
+schtasks /Query /TN "McTrader_Market_Data_Service_Daily" /FO LIST /V
+.\run.ps1 -Daily                      # by hand
+.\run.ps1 -Daily -Since 2026-10-27    # after an outage
 ```
 
-It is not needed for the normal case and `stop.bat` does not depend on it.
+11:30 is not a round number: the US session closes at 16:00 ET (07:00 or 08:00 Sydney), and
+`data_service.sessions` treats a session as complete only three hours after its close, so an earlier
+refresh asks for a session the service still considers open.
 
-#### What does NOT work
+### The task-based stack it replaced
 
-- **Task Scheduler's "End".** It ends the *task*; the launcher starts the service detached, so the
-  process survives. With a boot-only trigger nothing restarts it, and the task reports success while
-  the service is untouched.
-- **`Stop-Process` or `taskkill` from your shell.** Session isolation, as above.
-- **Re-running `install-task.ps1 -Install`** changes the registration but does not restart a running
-  service by itself.
-
-**How to tell a restart actually happened:** the pid changes and the service log gains a fresh
-`starting ... pid=` line. The task's result code will not tell you.
-
-#### The throttle, and the outage it caused
-
-The launcher refuses to start if it has started the service 30 times in the last hour, so a crash loop
-cannot spin forever. **The check runs before anything is stopped**, and that ordering is load-bearing:
-when it ran afterwards, the launcher killed the service and then refused to start a replacement,
-leaving it dead at 18:21:55 on 2026-10-29. A refusal must be inert, and the message now says
-`NOTHING WAS STOPPED`.
-
-### The alternative: a real Windows service
-
-`install-service.ps1` (NSSM) is still here for a LocalSystem deployment. It is **not** the recommended
-route now, because it costs you the keyring: you would then have to supply the key via
-`-EodhdApiKey` (plaintext in the registry) or by POSTing it to `/secrets/eodhd`.
-
-> **`.cmd`, not `.ps1`.** This machine's PowerShell execution policy is `Restricted`, so a `.ps1` file
-> is refused before it runs — `File ... cannot be loaded because running scripts is disabled`. The
-> `.cmd` wrappers exist for that: they pass `-ExecutionPolicy Bypass` for one process instead of
-> changing a setting for your whole account.
->
-> If you would rather run `.ps1` directly everywhere, `Set-ExecutionPolicy -Scope CurrentUser
-> RemoteSigned` does it without elevation and is a common setting (local scripts run, downloaded ones
-> must be signed). That is your call, not something these scripts change for you.
-
-```cmd
-install-service.cmd -Status
-install-service.cmd -Install     :: from an ELEVATED prompt
-install-service.cmd -Remove      :: elevated
-```
-
-`.cmd` and not `.ps1` because this machine's PowerShell execution policy is `Restricted`. The
-wrapper passes `-ExecutionPolicy Bypass` for one process rather than changing a security setting
-for the whole account.
+`install-task.ps1` still works and is kept for reference, but it is **superseded**: it registered a
+boot-only keep-alive (no crash recovery), a stop task, and a refresh task at 11:30. Only the
+keep-alive was ever actually registered here, which is why the whole-market pull stopped on 2026-10-29
+with nothing to notice it. Do not run both — the service and a task share port 8003.
 
 | Setting | Value | Why |
 |---|---|---|
-| Start | `SERVICE_AUTO_START` | this service is on the critical path at 10:30 |
-| Account | `LocalSystem` | no password stored anywhere (see below) |
+| Start | `SERVICE_AUTO_START` | on the critical path at 10:30 |
+| Account | `.\AndrewBot` | the keyring is per user (LocalSystem: see the next two sections) |
 | DependOnService | `MSSQLSERVER` | the app calls `ensure_schema()` on startup |
 | AppExit | `Restart`, delay 5 s, throttle 10 s | a crash is retried, without a tight loop |
 | AppStopMethodConsole | 20 s | a cycle mid-flight is not cut short by a restart |
 
 ### The service account and SQL Server
 
-A service with no `ObjectName` runs as `NT AUTHORITY\SYSTEM`, and SQL Server sees **that** identity,
-not the account you are logged in as. SYSTEM had a login here but no database users, so the service
-would have installed cleanly and then failed on every start.
+Only relevant to a **LocalSystem** install (`-Install` without `-AsUser`): SQL Server then sees
+`NT AUTHORITY\SYSTEM`, not the account you are logged in as. SYSTEM has a login here but no database
+users, so the service would install cleanly and fail on every start.
 
 Fixed by grant, not by password:
 
 ```
-Back_Test: db_datareader, db_datawriter, db_ddladmin
+Market_Data: db_datareader, db_datawriter, db_ddladmin
 ```
 
 `db_ddladmin` because the app creates its three tables on startup if they are absent. Least
@@ -750,11 +692,10 @@ privilege, and no credential on disk.
 `POST /secrets/eodhd` writes the key into **this process account's** keyring and starts using it
 immediately — no restart.
 
-That matters because the keyring is per user. A service running as `NT AUTHORITY\SYSTEM` cannot see a
-key stored under an interactive account, and only the service itself can write into SYSTEM's vault. So
-this endpoint is how a LocalSystem service is given a key it can actually read — and it is better than
-passing `EODHD_API_KEY` in the environment, because the credential store is encrypted by Windows
-whereas an environment variable sits in plaintext in the registry.
+That is how a LocalSystem service is given a key it can actually read: a service running as SYSTEM
+cannot see a key stored under an interactive account, and only the service itself can write into
+SYSTEM's vault. It is better than passing `EODHD_API_KEY` in the environment, because the credential
+store is encrypted by Windows whereas an environment variable sits in plaintext in the registry.
 
 ```powershell
 Invoke-RestMethod -Method Post http://127.0.0.1:8003/secrets/eodhd `
