@@ -641,21 +641,33 @@ wedged child that will not serve HTTP — after which NSSM's restart is usually 
 `.\install-service.ps1 -Status|-Start|-Stop|-Restart|-Remove` are the scripted equivalents; all but
 `-Status` need an elevated shell.
 
-### The daily job is still a scheduled task
+### Collection is a schedule inside the service, not a task
 
-`McTrader_Market_Data_Service_Daily`, daily at **11:30 local**, runs `run.ps1 -Daily` →
-`jobs.daily`. It is deliberately **not** `POST /refresh`: a job that goes through the service cannot
-cover for the service being down, which is the failure it exists to survive.
+The service collects on its own clock: at each venue's **open + 45 minutes**, with **one retry
+fifteen minutes later** and nothing after that.
+
+| market | venue opens | fires at | UTC |
+|---|---|---|---|
+| US | 09:30 New York | 10:15 New York | 14:15Z on EDT, 15:15Z on EST |
+| AU | 10:00 Sydney | 10:45 Sydney | 23:45Z the previous UTC day |
+
+Both times come from the market clock, so a daylight-saving change moves the collection with the
+session. The guard is at the point of collection, not only on the timer: nothing is written outside
+the venue's session, including from a manual run — a price collected at 02:00 on a Sunday is a stale
+echo or a synthetic print, and either is what a screener should not be ranking on.
 
 ```powershell
-schtasks /Query /TN "McTrader_Market_Data_Service_Daily" /FO LIST /V
-.\run.ps1 -Daily                      # by hand
-.\run.ps1 -Daily -Since 2026-10-27    # after an outage
+Invoke-RestMethod http://127.0.0.1:8003/schedule    # what it is, and what it did
+Invoke-RestMethod -Method Post 'http://127.0.0.1:8003/schedule/run?market=AU'   # run one now
+.\run.ps1 -Daily -Since 2026-10-27                  # close a gap by hand
 ```
 
-11:30 is not a round number: the US session closes at 16:00 ET (07:00 or 08:00 Sydney), and
-`data_service.sessions` treats a session as complete only three hours after its close, so an earlier
-refresh asks for a session the service still considers open.
+`GET /schedule` reports `done`, `waiting` or **`manual-intervention`** — the last means two attempts
+failed and the service has stopped trying, by design.
+
+The external `McTrader_Market_Data_Service_Daily` task (11:30 local) was **retired on 2026-11-01**: it
+pulled the same session the schedule had already collected, for 100 units a day. `run.ps1 -Daily` is
+still there for a manual backfill; nothing calls it on a timer.
 
 ### The task-based stack it replaced
 
