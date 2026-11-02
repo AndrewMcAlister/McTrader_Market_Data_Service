@@ -321,6 +321,31 @@ Notes that are load-bearing:
 - `TableDoc` / `ColumnDoc` rows are written for all three tables, following this database's
   own convention.
 
+### Indexes, and the weekly rebuild
+
+Three indexes carry the reads: `PK_DailySnapshot` (SymbolCode, Exchange, SnapshotDate) for one
+symbol's series, `PK_IndicatorCache` (SymbolCode, Exchange) and `PK_SymbolPriceCache`
+(SymbolCode, Venue). The one gap was the *session-wide* read — every symbol's bar for one date,
+which is what movers and the close-to-close comparisons do. `sql/002_indexes.sql` replaces
+`IX_DailySnapshot_Date` with `IX_DailySnapshot_Session (SnapshotDate, Exchange) INCLUDE (Open,
+High, Low, Close, Volume, IsAdjusted)`. Measured before that change: 11,986 scans of the date
+index against 9,595 key lookups into the 223 MB clustered index — the signature of a
+non-covering index, confirmed by three separate missing-index hints.
+
+`sql/003_index_maintenance.sql` creates `dbo.usp_MMDS_MaintainIndexes`, which reads
+fragmentation in LIMITED mode, rebuilds at 30% and reorganises at 10%, updates statistics, and
+records every index it considered in `dbo.IndexMaintenanceLog` — including the ones it skipped,
+so "ran and did nothing" is distinguishable from "did not run".
+
+```sql
+EXEC dbo.usp_MMDS_MaintainIndexes @WhatIf = 1;   -- the plan, changing nothing
+EXEC dbo.usp_MMDS_MaintainIndexes;               -- do it (offline: this is Standard edition)
+```
+
+Run it after a bulk change and weekly, outside the two collection windows (10:45 Sydney for the
+ASX, 02:15 for the US). `@IncludeWarehouse = 1` extends it to `BarHourly` / `BarReal5Min*`,
+which are otherwise left alone — a fullscan of 77 million rows is not a maintenance task.
+
 ### Expect ~27,700 rows per session, not ~2,800
 
 `/eod-bulk-last-day/US` returns the **whole US market** including OTC and pink sheets —
