@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Verify dbo.BarReal5Min_New against its daily reference before the swap.
+"""Verify dbo.BarReal5Min against its daily reference.
 
-The rebuild already verified each series as it fetched it, but that check ran one
-symbol at a time and wrote the result to a JSON report. This is the independent
-check on what actually landed in the table:
+Each series was verified as it was fetched during the one-time load, but that check
+ran one symbol at a time and wrote the result to a JSON report. This is the
+independent check on what actually landed in the table:
 
   * row and symbol counts, by Exchange, and the time range;
   * every bar inside the venue's regular session (09:30-16:00 ET, 10:00-16:00 Sydney);
@@ -11,8 +11,8 @@ check on what actually landed in the table:
   * each symbol's daily High/Low rebuilt from the table and compared with
     DailySnapshot (Source='eodhd-backfill'), the same half-percent rule the
     classifier used;
-  * symbols missing from the new table, or present there and absent from the old,
-    and each symbol's row-count ratio against the old table.
+  * when an older table is supplied with ``--old-table``, symbols missing from this
+    table or present here and absent there, and each symbol's row-count ratio.
 
 The per-symbol daily check is annotated with the classifier's confidence, because a
 ``listing-only`` series can be correctly attributed while its daily feed is adjusted
@@ -21,7 +21,7 @@ not fail the run; a rate below the confidence's gate (95% for ``exact`` and its
 siblings, 80% for ``majority``) is a failure.
 
     python tools/verify_bar5min_new.py
-    python tools/verify_bar5min_new.py --table BarReal5Min_New
+    python tools/verify_bar5min_new.py --old-table some_previous_table
 """
 
 from __future__ import annotations
@@ -46,7 +46,9 @@ CLASSIFICATION = WORK_DIR / "bar5min_exchange_report.json"
 REPORT = WORK_DIR / "verify_bar5min_new.json"
 REPORT_CSV = WORK_DIR / "verify_bar5min_new.csv"
 
-OLD_TABLE = "BarReal5Min"
+#: There is no older table after the swap. Supplying one adds the missing/extra and
+#: row-count-ratio checks; leaving it out keeps this a standalone check of the live table.
+OLD_TABLE = None
 DAILY_SOURCE = "eodhd-backfill"
 
 #: SQL Server's time-zone names, not the vendor's venue codes.
@@ -235,8 +237,9 @@ def _old_symbol_rows(store: Store, table: str) -> Dict[str, int]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--table", default="BarReal5Min_New")
-    parser.add_argument("--old-table", default=OLD_TABLE)
+    parser.add_argument("--table", default="BarReal5Min")
+    parser.add_argument("--old-table", default=OLD_TABLE,
+                        help="an older table to compare against; omit for the live table")
     parser.add_argument("--daily-source", default=DAILY_SOURCE)
     parser.add_argument("--classification", type=Path, default=CLASSIFICATION)
     parser.add_argument("--report", type=Path, default=REPORT)
@@ -282,7 +285,7 @@ def main() -> int:
     }
 
     rows = _symbol_rows(store, args.table)
-    old_rows = _old_symbol_rows(store, args.old_table)
+    old_rows = _old_symbol_rows(store, args.old_table) if args.old_table else {}
 
     for venue in sorted(by_exchange):
         violations = _session_violations(store, args.table, venue)
@@ -323,11 +326,15 @@ def main() -> int:
             bucket["below_gate"] += 1
             low_rate.append(row)
 
-    old_symbols = set(old_rows)
     new_symbols = {(row["symbol"], row["exchange"]) for row in details}
-    new_names = {symbol for symbol, _ in new_symbols}
-    missing = sorted(old_symbols - new_names)
-    extra = sorted(pair for pair in new_symbols if pair[0] not in old_symbols)
+    if args.old_table:
+        old_symbols = set(old_rows)
+        new_names = {symbol for symbol, _ in new_symbols}
+        missing = sorted(old_symbols - new_names)
+        extra = sorted(pair for pair in new_symbols if pair[0] not in old_symbols)
+    else:
+        missing = []
+        extra = []
     non_us = sorted(pair for pair in new_symbols if pair[1] != "US")
 
     summary["daily_match_by_confidence"] = dict(by_confidence)
@@ -351,8 +358,9 @@ def main() -> int:
 
     print(f"  daily match by confidence: {dict(by_confidence)}")
     print(f"  gated symbols below their confidence's gate: {len(low_rate)}")
-    print(f"  old symbols missing here:  {len(missing)} {missing[:10]}")
-    print(f"  new symbols not in old:    {len(extra)} {extra[:10]}")
+    if args.old_table:
+        print(f"  old symbols missing here:  {len(missing)} {missing[:10]}")
+        print(f"  new symbols not in old:    {len(extra)} {extra[:10]}")
     print(f"  new pairs not marked US:   {len(non_us)} {non_us[:10]}")
     print(f"  report -> {args.report}")
     print(f"  csv    -> {args.csv}")

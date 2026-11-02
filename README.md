@@ -343,7 +343,7 @@ EXEC dbo.usp_MMDS_MaintainIndexes;               -- do it (offline: this is Stan
 ```
 
 Run it after a bulk change and weekly, outside the two collection windows (10:45 Sydney for the
-ASX, 02:15 for the US). `@IncludeWarehouse = 1` extends it to `BarHourly` / `BarReal5Min*`,
+ASX, 02:15 for the US). `@IncludeWarehouse = 1` extends it to `BarHourly` / `BarReal5Min`,
 which are otherwise left alone — a fullscan of 77 million rows is not a maintenance task.
 
 ### Expect ~27,700 rows per session, not ~2,800

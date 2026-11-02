@@ -2,12 +2,12 @@
 
  * WHEN TO RUN IT
  *
- *   - after a bulk change (a backfill, the BarReal5Min swap, a dated re-pull), and
+ *   - after a bulk change (a backfill or a bulk load), and
  *   - weekly, outside the two collection windows (10:45 Sydney for the ASX, 02:15 for the US).
  *
  *   EXEC dbo.usp_MMDS_MaintainIndexes @WhatIf = 1;   -- what it would do, changing nothing
  *   EXEC dbo.usp_MMDS_MaintainIndexes;               -- AUTO: rebuild >= 30%, reorganise >= 10%
- *   EXEC dbo.usp_MMDS_MaintainIndexes @IncludeWarehouse = 1;  -- + BarHourly / BarReal5Min*
+ *   EXEC dbo.usp_MMDS_MaintainIndexes @IncludeWarehouse = 1;  -- + BarHourly / BarReal5Min
  *
  * WHAT IT DOES
  *
@@ -136,7 +136,7 @@ BEGIN
     WHERE (t.name IN ('DailySnapshot', 'SymbolPriceCache', 'IndicatorCache',
                       'EodhdUsage', 'RequestTypes', 'IndexMaintenanceLog')
            OR (@IncludeWarehouse = 1
-               AND t.name IN ('BarHourly', 'BarReal5Min', 'BarReal5Min_New', 'BarSynthetic5Min')))
+               AND t.name IN ('BarHourly', 'BarReal5Min')))
       AND i.type IN (1, 2)                 -- clustered and nonclustered; heaps and columnstore are not ours
       AND i.is_disabled = 0
       AND s.page_count >= @MinPageCount    -- under 64 pages (512 KB) a rebuild cannot pay for itself;
@@ -228,7 +228,7 @@ BEGIN
             JOIN sys.partitions AS p ON p.object_id = t.object_id AND p.index_id IN (0, 1)
             WHERE t.name IN ('DailySnapshot', 'SymbolPriceCache', 'IndicatorCache', 'EodhdUsage', 'RequestTypes')
                OR (@IncludeWarehouse = 1
-                   AND t.name IN ('BarHourly', 'BarReal5Min', 'BarReal5Min_New', 'BarSynthetic5Min'))
+                   AND t.name IN ('BarHourly', 'BarReal5Min'))
             GROUP BY t.name;
 
         OPEN stats;
