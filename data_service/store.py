@@ -608,7 +608,8 @@ class Store:
             conn.close()
 
     def big_movers(self, venue: str, limit: int = 25, min_price: float = 1.0,
-                   min_dollar_volume: float = 0.0) -> Dict[str, List[Dict[str, Any]]]:
+                   min_dollar_volume: float = 0.0,
+                   since: Optional[datetime] = None) -> Dict[str, List[Dict[str, Any]]]:
         """The venue's winners and losers by percent, from the price cache.
 
         Ranked by percent, floored by price and dollar volume, because a 300% move on
@@ -616,10 +617,19 @@ class Store:
         ``volume`` is the provider's latest cumulative volume, so a row collected at 10:15
         carries the volume traded up to 10:15 -- which is what "latest volume" means here.
 
-        Returns ``{"winners": [...], "losers": [...]}``. The caller decides whether the
-        data is current enough to serve; this method only answers what is in the cache.
+        ``since`` is an observation floor: pass the session open and a row left behind by
+        an earlier session is excluded rather than ranked as if it moved today. Without it
+        the method answers from every row in the cache -- correct for "what is cached",
+        wrong for "what is moving today".
+
+        Returns ``{"winners": [...], "losers": [...]}``.
         """
         limit = max(0, int(limit))
+        fresh = ""
+        if since is not None:
+            if since.tzinfo is not None:
+                since = since.astimezone(timezone.utc).replace(tzinfo=None)
+            fresh = "\n               AND COALESCE(AsOfUtc, LastUpdatedUtc) >= ?"
         sql = """
             SELECT TOP (?)
                    SymbolCode, Price, ChangePct, Volume, PreviousClose, AsOfUtc,
@@ -630,17 +640,19 @@ class Store:
                AND ChangePct IS NOT NULL
                AND Volume IS NOT NULL AND Volume > 0
                AND Price * Volume >= ?
-               AND ChangePct {direction} 0
+               AND ChangePct {direction} 0""" + fresh + """
           ORDER BY ChangePct {order}
         """
+        params: List[Any] = [limit, venue, float(min_price), float(min_dollar_volume)]
+        if since is not None:
+            params.append(since)
         out: Dict[str, List[Dict[str, Any]]] = {"winners": [], "losers": []}
         conn = self.connect()
         try:
             cursor = conn.cursor()
             for key, direction, order in (("winners", ">=", "DESC"),
                                           ("losers", "<", "ASC")):
-                cursor.execute(sql.format(direction=direction, order=order),
-                               limit, venue, float(min_price), float(min_dollar_volume))
+                cursor.execute(sql.format(direction=direction, order=order), *params)
                 for row in cursor.fetchall():
                     out[key].append({
                         "symbol": row[0],

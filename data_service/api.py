@@ -814,6 +814,11 @@ def create_app() -> FastAPI:
         ``available: false``, a reason, and empty lists: a caller branches on one field and
         never has to treat "no data yet" as an error.
 
+        Every ranked row must also have been observed at or after that session open, not
+        merely coexist in the cache with a fresh one: a name that dropped out of today's
+        priced universe carries the previous session's quote and must not be ranked as if
+        it moved today.
+
         ``change_pct`` is the provider's own, computed against the previous close that was
         observed with the price, so a split or a stale previous close shows up as the
         vendor reports it rather than as this service's guess.
@@ -861,7 +866,8 @@ def create_app() -> FastAPI:
 
         try:
             movers = store.big_movers(venue, limit=limit, min_price=min_price,
-                                      min_dollar_volume=min_dollar_volume)
+                                      min_dollar_volume=min_dollar_volume,
+                                      since=availability.session_open_utc)
         except Exception as exc:  # noqa: BLE001 - a broken query is a 503, not a 200 with no rows
             log.exception("todays-big-movers: query failed")
             return JSONResponse(status_code=503,

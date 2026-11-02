@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -313,3 +314,46 @@ def test_a_non_positive_limit_prices_no_universe():
 
     assert store.top_symbols_by_dollar_volume("AU", limit=0) == []
     assert connection.executed == []
+
+
+# ---------------------------------------------------------------------------
+# movers: "today" is an observation floor, not a cache-wide read
+# ---------------------------------------------------------------------------
+
+def test_big_movers_excludes_rows_observed_before_the_session_open():
+    """A name that dropped out of today's universe still carries yesterday's quote; it
+    must not be ranked as a mover today just because another row is fresh."""
+    connection = FakeConnection()
+    store = store_against(connection)
+    opened = datetime(2026, 11, 1, 23, 0)
+
+    store.big_movers("AU", limit=50, since=opened)
+
+    assert connection.executed, "no query was run"
+    for sql, params in connection.executed:
+        assert "COALESCE(AsOfUtc, LastUpdatedUtc) >= ?" in sql
+        assert params[-1] == opened
+
+
+def test_big_movers_normalises_an_aware_session_open_to_naive_utc():
+    """The column is naive UTC; an aware value from the clock must not reach pyodbc."""
+    connection = FakeConnection()
+    store = store_against(connection)
+    opened_sydney = datetime(2026, 11, 2, 10, 0,
+                             tzinfo=timezone(timedelta(hours=11)))
+
+    store.big_movers("AU", since=opened_sydney)
+
+    assert connection.executed[0][1][-1] == datetime(2026, 11, 1, 23, 0)
+
+
+def test_big_movers_without_a_session_floor_reads_the_whole_cache():
+    """The old contract is still available for a caller that wants it."""
+    connection = FakeConnection()
+    store = store_against(connection)
+
+    store.big_movers("AU", limit=5)
+
+    sql, params = connection.executed[0]
+    assert "COALESCE(AsOfUtc, LastUpdatedUtc) >=" not in sql
+    assert params == (5, "AU", 1.0, 0.0)
