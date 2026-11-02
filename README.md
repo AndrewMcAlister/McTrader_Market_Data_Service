@@ -315,9 +315,13 @@ Notes that are load-bearing:
   and 50 are read by nothing today.
 - **Percent is derived, not stored** (`Atr / ReferencePrice × 100`). Storing it too would let
   it drift from the price it was measured against.
-- **`DailySnapshot.IsAdjusted`** records whether the row is split-adjusted. Store
+- **`DailySnapshot.IsAdjusted`** records whether `Close` is split-adjusted. `Close` stores
   `adjusted_close` — matching `BarHourly`, and *not* `BarReal5Min`, which is unadjusted and
   documented as such (`JDZG, 2026-03-23: $0.0928 against $20.925 the same day`).
+  **`RawClose`** stores the unadjusted close beside it: `Close` keeps a series continuous
+  across distributions, `RawClose` is the price that printed, and a candle body must read
+  both sides on one scale. It is `NULL` where not known (the `BarHourly` seed), and the
+  `/bars` cache-hit rule re-pulls a requested window from the vendor to fill it.
 - `TableDoc` / `ColumnDoc` rows are written for all three tables, following this database's
   own convention.
 

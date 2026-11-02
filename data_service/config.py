@@ -47,6 +47,15 @@ DEFAULT_SCHEDULE_PRICE_UNIVERSE = 100
 #: previous close. Fifteen is the floor; a request for fewer cannot produce ATR(14).
 DEFAULT_MIN_SESSIONS = 15
 
+#: How deep a vendor refresh asks for and keeps. ``/eod/`` bills one unit whatever the
+#: width of the window, so the history past what a caller asked for is already paid for;
+#: this is only about how much of it is written down. 560 sessions is roughly two years of
+#: trading -- the horizon support and resistance levels are read off -- and the window the
+#: request asks for is widened to ``sessions * 2`` calendar days to survive weekends and
+#: holidays. Asking shallow and storing shallow is how every symbol in the book ended up
+#: averaging ~55 sessions against a five-year span.
+DEFAULT_HISTORY_SESSIONS = 560
+
 #: The periods the consumer set actually reads. 22 is McTrader's Chandelier window and its
 #: preferred stop ATR; 26 is PortfolioAdvisor's MACD-V divisor. 20 and 50 are carried
 #: because they were asked for, and are read by nothing today.
@@ -102,6 +111,7 @@ class Settings:
     bulk_breakeven: int = DEFAULT_BULK_BREAKEVEN
     schedule_price_universe: int = DEFAULT_SCHEDULE_PRICE_UNIVERSE
     min_sessions: int = DEFAULT_MIN_SESSIONS
+    history_sessions: int = DEFAULT_HISTORY_SESSIONS
     atr_periods: tuple = DEFAULT_ATR_PERIODS
     atr_period: int = DEFAULT_ATR_PERIOD
     #: Gap-inclusive true range. `high_low` is available and is NOT the default, because
@@ -212,6 +222,7 @@ def load(api_key: Optional[str] = None) -> Settings:
         schedule_price_universe=_env_int("MDS_SCHEDULE_PRICE_UNIVERSE",
                                          DEFAULT_SCHEDULE_PRICE_UNIVERSE),
         min_sessions=_env_int("MDS_MIN_SESSIONS", DEFAULT_MIN_SESSIONS),
+        history_sessions=_env_int("MDS_HISTORY_SESSIONS", DEFAULT_HISTORY_SESSIONS),
         atr_periods=tuple(periods) if periods else DEFAULT_ATR_PERIODS,
         atr_period=_env_int("MDS_ATR_PERIOD", DEFAULT_ATR_PERIOD),
         atr_method=_env("MDS_ATR_METHOD", "tr").lower(),

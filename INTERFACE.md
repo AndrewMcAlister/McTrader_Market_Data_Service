@@ -198,7 +198,8 @@ Completed daily bars.
       "provider": "cache",
       "source": "cache",
       "rows": [
-        { "d": "2026-10-08", "o": 250.1, "h": 254.9, "l": 249.2, "c": 253.7, "v": 51200000 }
+        { "d": "2026-10-08", "o": 250.1, "h": 254.9, "l": 249.2, "c": 253.7, "cr": 253.9,
+          "v": 51200000 }
       ]
     }
   },
@@ -209,9 +210,15 @@ Completed daily bars.
 | Field | Meaning |
 |---|---|
 | `as_of_session` | the last completed session in `rows` |
-| `adjusted` | whether the series is split-adjusted |
+| `adjusted` | whether `c` is split-adjusted |
+| `cr` | the **unadjusted** close; `null` means not known (a `BarHourly` seed, or a row not yet re-pulled). Candle bodies and order prices read this, never `c` on a series that says adjusted |
 | `provider` | `cache` or the provider that answered (`eodhd`, `yahoo`, `binance`) |
 | `short_history` | symbols with fewer sessions than asked |
+
+A cache hit requires a raw close on every served row. If any is missing the service refreshes
+that symbol from the vendor once — one unit whatever the window — and the response's `fetched`
+names it. `allow_fetch: false` never refreshes, so a caller that wants raw closes must allow
+the fetch.
 
 `venue` chooses the series: the cache is keyed by `(symbol, exchange)`, so `AAPL` at
 `venue=AU` is a different instrument from `AAPL` at `venue=US`. A venue with a short series

@@ -95,6 +95,10 @@ class ProviderBar:
     close: float
     volume: int = 0
     adjusted: bool = True
+    #: The unadjusted close. ``close`` may be adjusted (EODHD's adjusted_close); this is the
+    #: price that printed, which candle bodies and structure read. None means the provider
+    #: cannot express it -- not zero, and not "same as close" (that must be said explicitly).
+    raw_close: Optional[float] = None
 
 
 class ProviderError(RuntimeError):

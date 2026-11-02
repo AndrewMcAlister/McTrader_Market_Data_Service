@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import re
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -109,6 +109,7 @@ def row_for_daily() -> dict:
     return {
         "symbol": "CBA", "exchange": "AU", "session": "2026-10-30",
         "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5,
+        "raw_close": 100.6,
         "volume": 1000, "source": "eod-bulk", "adjusted": True,
     }
 
@@ -140,6 +141,19 @@ def test_the_stage_table_has_every_column_the_merge_inserts():
     assert not missing, f"#stage has no {missing}; the MERGE would read a column that is not there"
 
 
+def test_the_daily_merge_carries_the_raw_close_both_ways():
+    columns, values = insert_shape(_MERGE_DAILY_FROM_STAGE)
+    assert "RawClose" in columns
+    assert "source.[RawClose]" in values
+
+
+def test_a_raw_less_source_cannot_erase_a_known_raw_close():
+    """The BarHourly seed and the write benchmark rewrite rows without a raw close. The
+    UPDATE must keep the collected value rather than nulling it."""
+    assert ("[RawClose] = COALESCE(source.[RawClose], target.[RawClose])"
+            in _MERGE_DAILY_FROM_STAGE)
+
+
 def test_upsert_daily_binds_one_parameter_per_stage_column():
     connection = FakeConnection()
     store = store_against(connection)
@@ -147,8 +161,9 @@ def test_upsert_daily_binds_one_parameter_per_stage_column():
     assert store.upsert_daily([row_for_daily()]) == 1
 
     insert_sql, payload = connection.executed[1]
-    assert insert_sql.count("?") == len(payload[0]) == 10
+    assert insert_sql.count("?") == len(payload[0]) == 11
     assert payload[0][0:2] == ("CBA", "AU")
+    assert payload[0][7] == 100.6          # RawClose, the unadjusted close
     assert connection.committed
 
 
@@ -305,6 +320,39 @@ def test_the_universe_is_ranked_by_dollar_volume():
     sql, _ = connection.executed[0]
     assert "d.[Close] * d.Volume DESC" in sql
     assert "d.[Close] > 0" in sql and "d.Volume > 0" in sql
+
+
+# ---------------------------------------------------------------------------
+# history depth: how much of a symbol's series is already stored
+# ---------------------------------------------------------------------------
+
+def test_the_depth_count_binds_the_venue_the_symbols_and_the_horizon():
+    connection = FakeConnection(rows=[("cba", 560), ("bhp", 12)])
+    store = store_against(connection)
+
+    depths = store.daily_bar_depth(["cba", "bhp"], "AU", since=date(2023, 1, 1))
+
+    sql, params = connection.executed[0]
+    assert "GROUP BY SymbolCode" in sql
+    assert "SnapshotDate >= ?" in sql
+    assert params == ("AU", "CBA", "BHP", date(2023, 1, 1))
+    assert depths == {"CBA": 560, "BHP": 12}
+
+
+def test_a_symbol_with_no_stored_bars_has_depth_zero():
+    """Absent from the grouped result means none, not "unknown" -- the caller deepens."""
+    connection = FakeConnection(rows=[("cba", 40)])
+    store = store_against(connection)
+
+    assert store.daily_bar_depth(["CBA", "BHP"], "AU") == {"CBA": 40, "BHP": 0}
+
+
+def test_a_depth_count_with_no_symbols_asks_the_database_nothing():
+    connection = FakeConnection()
+    store = store_against(connection)
+
+    assert store.daily_bar_depth([], "AU") == {}
+    assert connection.executed == []
 
 
 def test_a_non_positive_limit_prices_no_universe():

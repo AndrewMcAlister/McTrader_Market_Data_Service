@@ -47,6 +47,9 @@ class FakeClient:
         # A test that needs the vendor to have caught up sets this to 0.
         self.eod_start = eod_start
         self.calls = {"real_time": 0, "real_time_bulk": 0, "eod": 0}
+        # The width each /eod/ call was asked for. The vendor bills one unit whatever it is,
+        # so this is the only way a test can see how much history was requested.
+        self.eod_days: list = []
         self.units = 0
 
     def real_time(self, symbol: str, venue: str = "US"):
@@ -69,6 +72,7 @@ class FakeClient:
 
     def eod(self, symbol: str, venue: str = "US", days: int = 60, to_date=None):
         self.calls["eod"] += 1
+        self.eod_days.append(days)
         self.units += 1
         rows = []
         for index, session in enumerate(_past_sessions(self.bars_per_symbol, start=self.eod_start)):
@@ -76,7 +80,9 @@ class FakeClient:
             rows.append({
                 "date": session.isoformat(), "open": base, "high": base + 2.0,
                 "low": base - 2.0, "close": base + 0.5, "volume": 1000,
-                "adjusted_close": base + 0.5,
+                # Deliberately different from the raw close: a payload that echoed one value
+                # for both fields would pass a test that could not tell them apart.
+                "adjusted_close": base + 0.4,
             })
         return rows
 
@@ -119,6 +125,14 @@ class FakeStore:
             bucket = self.daily.get(symbol, {})
             rows = sorted(bucket.values(), key=lambda r: r["session"])
             out[symbol] = [dict(r) for r in rows[-sessions:]]
+        return out
+
+    def daily_bar_depth(self, symbols, exchange="US", since=None):
+        out = {}
+        for raw in symbols:
+            symbol = raw.strip().upper()
+            rows = self.daily.get(symbol, {}).values()
+            out[symbol] = sum(1 for r in rows if since is None or r["session"] >= since)
         return out
 
     def upsert_daily(self, rows):
@@ -297,6 +311,98 @@ def test_bars_declare_their_session_and_adjustment():
     assert entry["sessions"] == 15
     assert entry["adjusted"] is True
     assert entry["as_of_session"] < date.today().isoformat()
+
+
+def test_bars_carry_both_closes():
+    """``c`` is the adjusted series; ``cr`` is the price that printed. They are two scales,
+    and a candle body that mixes them reads a dividend as a gap."""
+    products, _, _ = _products()
+    entry = products.bars(["AAPL"], sessions=15)["bars"]["AAPL"]
+
+    first = entry["rows"][0]
+    assert first["c"] is not None and first["cr"] is not None
+    assert first["cr"] == pytest.approx(first["c"] + 0.1)
+
+
+# ---------------------------------------------------------------------------
+# bars: a vendor refresh fills two years, not three weeks
+#
+# The hole these pin: ``need`` was ``max(sessions, min_sessions)`` -- fifteen -- so every
+# /eod/ call asked for a sixty-day window and kept fifteen bars of it, while the tariff
+# bills one unit whatever the width. Every symbol in the book averaged 55 sessions against
+# a five-year span, which is not a series a support level can be drawn on.
+# ---------------------------------------------------------------------------
+
+def _seed_history(store, symbol: str, sessions: int, newest: date) -> None:
+    """Give *symbol* a stored series of *sessions* daily rows ending at *newest*."""
+    for offset in range(sessions):
+        session = newest - timedelta(days=offset)
+        store.daily.setdefault(symbol, {})[session] = {
+            "symbol": symbol, "exchange": "US", "session": session,
+            "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5,
+            "raw_close": 100.6, "volume": 1000, "source": "eodhd", "adjusted": True,
+        }
+
+
+def test_a_first_refresh_asks_for_the_whole_history_window():
+    products, client, _ = _products()
+
+    products.bars(["AAPL"], sessions=15)
+
+    assert client.calls["eod"] == 1
+    # One unit either way, so the window is widened: two calendar days per session leaves
+    # room for the weekends and holidays inside it.
+    assert client.eod_days == [2 * products.settings.history_sessions]
+
+
+def test_a_series_that_already_reaches_the_horizon_is_refreshed_shallow(monkeypatch):
+    """The depth check is what keeps a fill from becoming a nightly rewrite of 560 rows."""
+    products, client, store = _products()
+    newest = date.today() - timedelta(days=2)
+    _seed_history(store, "AAPL", products.settings.history_sessions, newest)
+    _pin_session(monkeypatch, newest + timedelta(days=1))   # one session behind
+
+    products.bars(["AAPL"], sessions=15)
+
+    assert client.eod_days == [60]          # a 15-session refresh, not another two years
+
+
+def test_a_listing_younger_than_the_horizon_is_asked_deep_only_once(monkeypatch):
+    """A young listing can never reach the target depth; without the ``achieved`` guard it
+    would be re-asked at full width every session for the rest of its life."""
+    products, client, store = _products()   # the fake vendor holds 40 sessions for it
+    products.bars(["IPO"], sessions=15)
+    assert client.eod_days == [2 * products.settings.history_sessions]
+
+    newest = max(r["session"] for r in store.daily["IPO"].values())
+    _pin_session(monkeypatch, newest + timedelta(days=1))
+    products.bars(["IPO"], sessions=15)
+
+    assert client.eod_days == [2 * products.settings.history_sessions, 60]
+
+
+def test_a_current_cache_without_raw_closes_is_refreshed_once(monkeypatch):
+    """Pre-existing rows have no RawClose. One vendor call fills the served window; the next
+    request is a cache hit, so the backfill cannot become a call per scan.
+
+    Rebuilt as a fresh ``Products`` because the in-process refresh memory belongs to the
+    process that made the first call; a restart is exactly the deployment this models.
+    """
+    products, client, store = _products()
+    products.bars(["AAPL"], sessions=15)
+    newest = max(row["session"] for row in store.daily["AAPL"].values())
+    _pin_session(monkeypatch, newest)
+
+    for row in store.daily["AAPL"].values():
+        row.pop("raw_close", None)
+
+    restarted = Products(products.settings, store, client=client, router=products.router)
+    restarted.bars(["AAPL"], sessions=15)
+    assert client.calls["eod"] == 2
+    assert all(r["raw_close"] is not None for r in store.daily["AAPL"].values())
+
+    restarted.bars(["AAPL"], sessions=15)
+    assert client.calls["eod"] == 2
 
 
 def test_allow_fetch_false_never_touches_the_vendor():

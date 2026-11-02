@@ -94,6 +94,11 @@ def _epoch_to_utc(value: Any) -> Optional[datetime]:
 #: hour -- while still catching the publication an hour after it happens.
 BARS_REFRESH_TTL_SECONDS = 3600.0
 
+#: Calendar days a session depth spans, for counting how much history a symbol holds:
+#: seven for five is the weekend, and forty days of margin covers the holidays in between.
+def _history_window_days(sessions: int) -> int:
+    return int(sessions * 7 / 5) + 40
+
 
 def _number(value: Any) -> Optional[float]:
     try:
@@ -156,6 +161,11 @@ class Products:
         # and remembering the attempt keeps that to one call per symbol per retry window
         # rather than one per caller -- see BARS_REFRESH_TTL_SECONDS.
         self._bars_refreshed: Dict[Tuple[str, str], Tuple[date, datetime]] = {}
+        # (market, symbol) -> how many sessions the last *deep* vendor pull returned. A
+        # listing younger than the history window can never reach the target depth, so
+        # without this it would be re-asked at full width on every daily refresh; once a
+        # deep pull has returned everything the vendor has, the check stops trying.
+        self._bars_deep: Dict[Tuple[str, str], int] = {}
         self.counters: Dict[str, int] = {
             "price_from_cache": 0, "price_from_vendor": 0,
             "bars_from_cache": 0, "bars_from_vendor": 0,
@@ -427,6 +437,19 @@ class Products:
         venue's own clock said the day was over. The refresh it triggers is remembered by
         the session it was asked for, so a holiday costs one call per symbol, not one per
         request. The answer's ``as_of_session`` states which session was actually served.
+
+        A cache hit also requires a raw close on every served row: ``Close`` is the adjusted
+        series and ``RawClose`` is the traded one, and a window that carries only the first
+        cannot answer a candle-body question on a single price scale. A missing raw close
+        triggers one vendor refresh, so pre-existing rows are backfilled for the symbols
+        that are actually requested rather than for the whole market.
+
+        The same refresh also fills *depth*. ``/eod/`` bills one unit whatever the width of
+        the window, so a symbol whose stored series is still short of ``history_sessions``
+        (two years by default) is asked for that whole horizon; one that already reaches it
+        is refreshed for a handful of sessions and costs the same. That is what makes the
+        history accumulate as symbols are requested, instead of every symbol being pinned
+        at the fifteen sessions the window used to keep.
         """
         kind = normalise_asset_class(asset_class)
         market = "CRYPTO" if kind == "crypto" else normalise_venue(venue)
@@ -442,6 +465,11 @@ class Products:
 
         latest = latest_completed_session(market)
         banked = self.store.get_daily_bars_many(wanted, sessions, market)
+        target = max(1, int(self.settings.history_sessions))
+        horizon = latest - timedelta(days=_history_window_days(target))
+        # Asked for lazily: a request answered wholly from the cache must not pay for a
+        # count it will not use.
+        depths: Optional[Dict[str, int]] = None
 
         out: Dict[str, Any] = {}
         fetched: List[str] = []
@@ -450,9 +478,16 @@ class Products:
         for symbol in wanted:
             rows = [r for r in banked.get(symbol, []) if r["session"] <= latest]
             current = bool(rows) and rows[-1]["session"] >= latest
-            if len(rows) >= sessions and current:
+            served = rows[-sessions:]
+            # A served window is only ready when every row states its raw close. The two
+            # closes are two price scales, and a series half adjusted and half raw is worse
+            # than one that is wholly adjusted. Rows written before RawClose existed, and
+            # BarHourly seeds, are unknown; the vendor refresh below fills them once for the
+            # symbols actually asked for, which is the backfill.
+            raw_ready = bool(served) and all(r.get("raw_close") is not None for r in served)
+            if len(rows) >= sessions and current and raw_ready:
                 self.counters["bars_from_cache"] += 1
-                out[symbol] = self._bars_payload(symbol, rows[-sessions:], "cache", market)
+                out[symbol] = self._bars_payload(symbol, served, "cache", market)
                 continue
 
             keep = (market, symbol)
@@ -468,8 +503,19 @@ class Products:
                     out[symbol] = self._bars_payload(symbol, rows, "cache", market)
                 continue
 
-            # Enough sessions to answer, and one vendor call whatever the window.
+            # Enough sessions to answer, and one vendor call whatever the window. While the
+            # symbol's stored history is short of the horizon, ask for the whole horizon:
+            # the call is being made anyway and bills the same, so the depth is free, and
+            # it is the difference between a support level drawn on two years and one drawn
+            # on the three weeks this used to keep.
             need = max(sessions, self.settings.min_sessions)
+            if target > need:
+                if depths is None:
+                    depths = self.store.daily_bar_depth(wanted, market, since=horizon)
+                held = depths.get(symbol, 0)
+                achieved = self._bars_deep.get(keep, 0)
+                if held < target and not (achieved and held >= achieved):
+                    need = target
             self._bars_refreshed[keep] = (latest, _utc_naive())
             try:
                 provider_rows, provider_name = self.router.bars(
@@ -486,6 +532,8 @@ class Products:
 
             fresh_rows = self._write_provider_bars(symbol, provider_rows, provider_name,
                                                    market)
+            if need >= target:
+                self._bars_deep[keep] = len(provider_rows)
             fetched.append(symbol)
             self.counters["bars_from_vendor"] += 1
             fresh_rows = [r for r in fresh_rows if r["session"] <= latest]
@@ -526,6 +574,7 @@ class Products:
                 "high": bar.high,
                 "low": bar.low,
                 "close": bar.close,
+                "raw_close": getattr(bar, "raw_close", None),
                 "volume": int(bar.volume or 0),
                 "source": provider_name or "unknown",
                 "adjusted": bool(getattr(bar, "adjusted", True)),
@@ -554,6 +603,9 @@ class Products:
                 {
                     "d": r["session"].isoformat(),
                     "o": r["open"], "h": r["high"], "l": r["low"], "c": r["close"],
+                    # The unadjusted close. ``c`` is adjusted when the series says so, and a
+                    # candle body must not mix the two scales; null means not known.
+                    "cr": r.get("raw_close"),
                     "v": r.get("volume"),
                 }
                 for r in rows
@@ -782,6 +834,7 @@ class Products:
                 "price_ttl_seconds": self.settings.price_ttl_seconds,
                 "bulk_breakeven": self.settings.bulk_breakeven,
                 "min_sessions": self.settings.min_sessions,
+                "history_sessions": self.settings.history_sessions,
                 "atr_periods": list(self.settings.atr_periods),
                 "atr_method": self.settings.atr_method,
                 "atr_smoothing": self.settings.atr_smoothing,

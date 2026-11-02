@@ -40,15 +40,19 @@ USING #stage AS source
    AND target.SnapshotDate = source.SnapshotDate
 WHEN MATCHED THEN UPDATE SET
     [Open] = source.[Open], [High] = source.[High], [Low] = source.[Low],
-    [Close] = source.[Close], Volume = source.Volume, Source = source.Source,
+    [Close] = source.[Close],
+    -- A source with no raw close (the BarHourly seed, or a replayed benchmark row) must not
+    -- erase one already collected. COALESCE keeps the known value; a fresh pull overwrites it.
+    [RawClose] = COALESCE(source.[RawClose], target.[RawClose]),
+    Volume = source.Volume, Source = source.Source,
     IsAdjusted = source.IsAdjusted, LoadedUtc = SYSUTCDATETIME()
 WHEN NOT MATCHED THEN INSERT
-    (SymbolCode, Exchange, SnapshotDate, [Open], [High], [Low], [Close], Volume, Source,
-     IsAdjusted)
+    (SymbolCode, Exchange, SnapshotDate, [Open], [High], [Low], [Close], [RawClose], Volume,
+     Source, IsAdjusted)
 VALUES
     (source.SymbolCode, source.Exchange, source.SnapshotDate, source.[Open],
-     source.[High], source.[Low], source.[Close], source.Volume, source.Source,
-     source.IsAdjusted);
+     source.[High], source.[Low], source.[Close], source.[RawClose], source.Volume,
+     source.Source, source.IsAdjusted);
 """
 
 _CREATE_STAGE_DAILY = """
@@ -60,6 +64,7 @@ CREATE TABLE #stage (
     [High]       decimal(18,6) NOT NULL,
     [Low]        decimal(18,6) NOT NULL,
     [Close]      decimal(18,6) NOT NULL,
+    [RawClose]   decimal(18,6) NULL,
     Volume       bigint        NOT NULL,
     Source       varchar(16)   NOT NULL,
     IsAdjusted   bit           NOT NULL
@@ -350,10 +355,10 @@ class Store:
                     cursor,
                     f"""
                     SELECT SymbolCode, SnapshotDate, [Open], [High], [Low], [Close],
-                           Volume, Source, IsAdjusted
+                           Volume, Source, IsAdjusted, [RawClose]
                     FROM (
                         SELECT SymbolCode, SnapshotDate, [Open], [High], [Low], [Close],
-                               Volume, Source, IsAdjusted,
+                               Volume, Source, IsAdjusted, [RawClose],
                                ROW_NUMBER() OVER (PARTITION BY SymbolCode
                                                   ORDER BY SnapshotDate DESC) AS rn
                         FROM dbo.DailySnapshot
@@ -373,7 +378,45 @@ class Store:
                         "volume": int(row[6]) if row[6] is not None else None,
                         "source": row[7],
                         "adjusted": bool(row[8]),
+                        "raw_close": _float(row[9]),
                     })
+        finally:
+            conn.close()
+        return out
+
+    def daily_bar_depth(self, symbols: Sequence[str], exchange: str = "US",
+                        since: Optional[date] = None) -> Dict[str, int]:
+        """How many sessions each symbol holds in ``DailySnapshot`` on or after *since*.
+
+        The bars path asks this before a vendor refresh: one ``/eod/`` call costs a unit
+        whatever its width, so asking for two years costs nothing extra, but re-writing
+        several hundred rows per symbol on every daily refresh is real write load. Counting
+        first makes the deep fetch a fill rather than a nightly rewrite. One range on the
+        clustered key per symbol, grouped into a single query.
+        """
+        wanted = [s.strip().upper() for s in symbols if s and s.strip()]
+        if not wanted:
+            return {}
+        out: Dict[str, int] = {s: 0 for s in wanted}
+        conn = self.connect()
+        try:
+            cursor = conn.cursor()
+            for start in range(0, len(wanted), 500):
+                chunk = wanted[start:start + 500]
+                placeholders = ",".join("?" * len(chunk))
+                sql = f"""
+                    SELECT SymbolCode, COUNT(*)
+                      FROM dbo.DailySnapshot
+                     WHERE Exchange = ? AND SymbolCode IN ({placeholders})
+                """
+                params: List[Any] = [_exchange_key(exchange), *chunk]
+                if since is not None:
+                    sql += " AND SnapshotDate >= ?"
+                    params.append(since)
+                sql += " GROUP BY SymbolCode"
+                self._execute(cursor, sql, *params)
+                for row in cursor.fetchall():
+                    out[str(row[0]).upper()] = int(row[1])
         finally:
             conn.close()
         return out
@@ -397,7 +440,7 @@ class Store:
         payload = [
             (
                 r["symbol"], _exchange_key(r.get("exchange"), required=True), r["session"],
-                r["open"], r["high"], r["low"], r["close"],
+                r["open"], r["high"], r["low"], r["close"], r.get("raw_close"),
                 int(r.get("volume") or 0), r.get("source") or "eod-bulk",
                 bool(r.get("adjusted", True)),
             )
@@ -413,8 +456,8 @@ class Store:
             for start in range(0, len(payload), 20000):
                 cursor.executemany(
                     "INSERT INTO #stage (SymbolCode, Exchange, SnapshotDate, [Open], [High], "
-                    "[Low], [Close], Volume, Source, IsAdjusted) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    "[Low], [Close], [RawClose], Volume, Source, IsAdjusted) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     payload[start:start + 20000])
             cursor.execute(_MERGE_DAILY_FROM_STAGE)
             conn.commit()

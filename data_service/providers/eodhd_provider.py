@@ -132,7 +132,8 @@ class EodhdProvider:
             if session > latest:
                 continue  # in-progress session: a partial range would shrink a stop
             adjusted = _number(raw.get("adjusted_close"))
-            close = adjusted if adjusted is not None else _number(raw.get("close"))
+            raw_close = _number(raw.get("close"))
+            close = adjusted if adjusted is not None else raw_close
             open_ = _number(raw.get("open"))
             high = _number(raw.get("high"))
             low = _number(raw.get("low"))
@@ -144,6 +145,9 @@ class EodhdProvider:
                 # False only when the vendor gave no adjusted close, so a caller can tell a
                 # raw series from an adjusted one instead of assuming.
                 adjusted=adjusted is not None,
+                # Both closes travel: Close keeps the series continuous across dividends and
+                # splits, RawClose is what a candle body and an order price are read off.
+                raw_close=raw_close,
             ))
 
         out.sort(key=lambda bar: bar.session)

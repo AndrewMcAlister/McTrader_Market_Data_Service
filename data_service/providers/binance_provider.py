@@ -177,6 +177,10 @@ class BinanceProvider:
             out.append(ProviderBar(
                 session=session, open=open_, high=high, low=low, close=close,
                 volume=int(volume or 0),
+                # Klines are the traded price and crypto has no distributions, so the close
+                # is the raw close. Saying it explicitly keeps RawClose from reading as
+                # "not collected" downstream.
+                raw_close=close,
             ))
 
         out.sort(key=lambda bar: bar.session)

@@ -106,6 +106,7 @@ BEGIN
         [High]       decimal(18,6) NOT NULL,
         [Low]        decimal(18,6) NOT NULL,
         [Close]      decimal(18,6) NOT NULL,
+        [RawClose]   decimal(18,6) NULL,
         Volume       bigint        NOT NULL CONSTRAINT DF_DailySnapshot_Volume DEFAULT (0),
         Source       varchar(16)   NOT NULL CONSTRAINT DF_DailySnapshot_Source DEFAULT ('eod-bulk'),
         IsAdjusted   bit           NOT NULL CONSTRAINT DF_DailySnapshot_IsAdjusted DEFAULT (1),
@@ -163,7 +164,7 @@ IF NOT EXISTS (SELECT 1 FROM dbo.TableDoc WHERE TableName = 'DailySnapshot')
     INSERT INTO dbo.TableDoc (TableName, Grain, Purpose, RowCountNote, DataSource)
     VALUES ('DailySnapshot',
             'one row per symbol per venue per session',
-            'Daily OHLCV, appended once per session by D:\McTrader_Market_Data_Service from EODHD /eod-bulk-last-day. IsAdjusted=1 rows carry adjusted_close, which matches BarHourly''s convention and must not be mixed with BarReal5Min, which is unadjusted. This is the series ATR is computed from; IndicatorCache holds the result.',
+            'Daily OHLCV, appended once per session by D:\McTrader_Market_Data_Service from EODHD /eod-bulk-last-day. Close is adjusted_close where the vendor supplies it (IsAdjusted=1), matching BarHourly''s convention and never mixed with BarReal5Min, which is unadjusted. RawClose is the unadjusted close and may be NULL where it is not known (the BarHourly seed). This is the series ATR is computed from; IndicatorCache holds the result.',
             'universe x sessions', 'measured');
 GO
 
@@ -213,8 +214,15 @@ GO
 IF NOT EXISTS (SELECT 1 FROM dbo.ColumnDoc WHERE TableName = 'DailySnapshot' AND ColumnName = 'IsAdjusted')
     INSERT INTO dbo.ColumnDoc (TableName, ColumnName, DataType, Unit, Meaning, Notes)
     VALUES ('DailySnapshot', 'IsAdjusted', 'bit', 'flag',
-            '1 = split-adjusted (EODHD adjusted_close); 0 = raw close.',
-            'Never mix 1 and 0 rows in one ATR: a split reads as a catastrophic move. Matches BarHourly (adjusted), not BarReal5Min (unadjusted).');
+            '1 = Close is split-adjusted (EODHD adjusted_close); 0 = Close is the raw close.',
+            'Never mix 1 and 0 rows in one ATR: a split reads as a catastrophic move. Matches BarHourly (adjusted), not BarReal5Min (unadjusted). RawClose is independent of this flag and is always the traded close.');
+GO
+
+IF NOT EXISTS (SELECT 1 FROM dbo.ColumnDoc WHERE TableName = 'DailySnapshot' AND ColumnName = 'RawClose')
+    INSERT INTO dbo.ColumnDoc (TableName, ColumnName, DataType, Unit, Meaning, Notes)
+    VALUES ('DailySnapshot', 'RawClose', 'decimal(18,6)', 'price',
+            'The unadjusted close the market actually traded.',
+            'Close answers "what is the adjusted series"; RawClose answers "what price printed", and candle bodies, structure and orders read the second. NULL means not known: the free BarHourly seed is split-adjusted only, and rows written before 2026-11-02 are filled by the service''s first on-demand re-pull for a symbol. Never treat NULL as zero or as Close without saying so at the call site.');
 GO
 
 IF NOT EXISTS (SELECT 1 FROM dbo.ColumnDoc WHERE TableName = 'SymbolPriceCache' AND ColumnName = 'PreviousClose')
@@ -372,6 +380,30 @@ GO
 
 UPDATE dbo.TableDoc SET Grain = 'one row per symbol per venue'
  WHERE TableName = 'IndicatorCache' AND Grain = 'one row per symbol';
+GO
+
+/* ------------------------------------------------------------------ */
+/* 6. RawClose on DailySnapshot (2026-11-02)                          */
+/* ------------------------------------------------------------------ */
+/* Close stores EODHD's adjusted_close while Open/High/Low stay raw, so a candle body read
+   from Close is on a different scale from its own wicks. RawClose carries the traded close
+   beside it. Existing rows are left NULL and are filled by the service's first on-demand
+   re-pull for a symbol (the /bars cache-hit rule refuses a window that is not raw-complete);
+   a whole-market re-pull would cost 100 units per session for a column only requested
+   symbols need.
+
+   Nullable on purpose: Back_Test.BarHourly is split-adjusted only, so seed rows have no raw
+   close to copy, and NULL says "not known" rather than inventing one. The MERGE preserves a
+   known RawClose when a raw-less source rewrites the row. */
+
+IF COL_LENGTH('dbo.DailySnapshot', 'RawClose') IS NULL
+    ALTER TABLE dbo.DailySnapshot ADD [RawClose] decimal(18,6) NULL;
+GO
+
+UPDATE dbo.TableDoc
+   SET Purpose = 'Daily OHLCV, appended once per session by D:\McTrader_Market_Data_Service from EODHD /eod-bulk-last-day. Close is adjusted_close where the vendor supplies it (IsAdjusted=1), matching BarHourly''s convention and never mixed with BarReal5Min, which is unadjusted. RawClose is the unadjusted close and may be NULL where it is not known (the BarHourly seed). This is the series ATR is computed from; IndicatorCache holds the result.'
+ WHERE TableName = 'DailySnapshot'
+   AND Purpose NOT LIKE '%RawClose%';
 GO
 
 IF NOT EXISTS (SELECT 1 FROM dbo.ColumnDoc WHERE TableName = 'DailySnapshot' AND ColumnName = 'Exchange')

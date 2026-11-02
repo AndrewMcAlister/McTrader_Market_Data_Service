@@ -21,13 +21,14 @@ cur = conn.cursor()
 cur.execute("SELECT MAX(SnapshotDate) FROM dbo.DailySnapshot")
 session = cur.fetchone()[0]
 cur.execute(
-    "SELECT SymbolCode, Exchange, SnapshotDate, [Open], [High], [Low], [Close], Volume, "
-    "Source, IsAdjusted FROM dbo.DailySnapshot WHERE SnapshotDate = ?", session)
+    "SELECT SymbolCode, Exchange, SnapshotDate, [Open], [High], [Low], [Close], [RawClose], "
+    "Volume, Source, IsAdjusted FROM dbo.DailySnapshot WHERE SnapshotDate = ?", session)
 rows = [
     {
         "symbol": r[0], "exchange": r[1], "session": r[2], "open": float(r[3]),
         "high": float(r[4]), "low": float(r[5]), "close": float(r[6]),
-        "volume": int(r[7]), "source": r[8], "adjusted": bool(r[9]),
+        "raw_close": None if r[7] is None else float(r[7]),
+        "volume": int(r[8]), "source": r[9], "adjusted": bool(r[10]),
     }
     for r in cur.fetchall()
 ]

@@ -61,7 +61,8 @@ def _row_from_bulk(raw: Dict[str, Any], session_date: date, market: str,
         return None
 
     adjusted_close = _float(raw.get("adjusted_close"))
-    close = adjusted_close if adjusted_close is not None else _float(raw.get("close"))
+    raw_close = _float(raw.get("close"))
+    close = adjusted_close if adjusted_close is not None else raw_close
     high = _float(raw.get("high"))
     low = _float(raw.get("low"))
     open_ = _float(raw.get("open"))
@@ -80,6 +81,9 @@ def _row_from_bulk(raw: Dict[str, Any], session_date: date, market: str,
         "high": high,
         "low": low,
         "close": close,
+        # The bulk feed carries both closes. Close stays the adjusted one for series
+        # continuity; RawClose is the price that printed, which structure and orders read.
+        "raw_close": raw_close,
         "volume": int(_float(raw.get("volume")) or 0),
         "source": "eod-bulk",
         # True only when adjusted_close was present: claiming adjustment for a raw close
@@ -230,6 +234,8 @@ def seed_from_barhourly(store: Store, days: int = 90, chunk: int = 20000,
             "volume": int(volume or 0),
             "source": "barhourly",
             "adjusted": True,
+            # No raw close: BarHourly is split-adjusted only. NULL says "not known"; the
+            # /bars cache-hit rule re-pulls a requested window from the vendor to fill it.
         })
 
     written = 0

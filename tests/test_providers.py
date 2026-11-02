@@ -22,6 +22,7 @@ from data_service.providers import (
     ProviderBar, ProviderError, ProviderQuote, ProviderRouter, order_for,
 )
 from data_service.providers.binance_provider import BinanceProvider
+from data_service.providers.eodhd_provider import EodhdProvider
 from data_service.providers.yahoo_provider import YahooProvider
 
 
@@ -209,6 +210,47 @@ def _yahoo_chart_payload(timestamps, meta=None):
             "error": None,
         }
     }
+
+
+class _ScriptedEodClient:
+    """An EODHD client whose one /eod/ answer is fixed."""
+
+    def __init__(self, rows) -> None:
+        self._rows = rows
+
+    def eod(self, ticker, market, days=None):
+        return list(self._rows)
+
+
+def test_eod_bars_carry_both_the_adjusted_and_the_raw_close():
+    """Close keeps the series continuous; RawClose is what the candle body printed."""
+    session = (date.today() - timedelta(days=2)).isoformat()
+    provider = EodhdProvider(_ScriptedEodClient([{
+        "date": session, "open": 26.63, "high": 27.20, "low": 26.47,
+        "close": 27.10, "adjusted_close": 26.709, "volume": 229441,
+    }]))
+
+    bars = provider.bars("LOV", "shares", sessions=10, venue="AU")
+
+    assert len(bars) == 1
+    assert bars[0].close == pytest.approx(26.709)
+    assert bars[0].raw_close == pytest.approx(27.10)
+    assert bars[0].adjusted is True
+
+
+def test_an_eod_bar_without_an_adjusted_close_reads_raw_on_both_fields():
+    """The vendor did not adjust it, so claiming adjustment would misreport the scale."""
+    session = (date.today() - timedelta(days=2)).isoformat()
+    provider = EodhdProvider(_ScriptedEodClient([{
+        "date": session, "open": 10.0, "high": 11.0, "low": 9.5,
+        "close": 10.5, "volume": 100,
+    }]))
+
+    (bar,) = provider.bars("AAPL", "shares", sessions=10)
+
+    assert bar.close == pytest.approx(10.5)
+    assert bar.raw_close == pytest.approx(10.5)
+    assert bar.adjusted is False
 
 
 def test_yahoo_quote_reads_price_and_previous_close():

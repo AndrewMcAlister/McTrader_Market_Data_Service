@@ -234,6 +234,9 @@ class YahooProvider:
             out.append(ProviderBar(
                 session=session, open=open_, high=high, low=low, close=close,
                 volume=int(_number(_at(volumes, index)) or 0),
+                # The chart request asks for neither events nor adjusted closes, so every
+                # field it returns is the raw one: close is already the traded close.
+                raw_close=close,
             ))
 
         out.sort(key=lambda bar: bar.session)
