@@ -316,12 +316,21 @@ Notes that are load-bearing:
 - **Percent is derived, not stored** (`Atr / ReferencePrice × 100`). Storing it too would let
   it drift from the price it was measured against.
 - **`DailySnapshot.IsAdjusted`** records whether `Close` is split-adjusted. `Close` stores
-  `adjusted_close` — matching `BarHourly`, and *not* `BarReal5Min`, which is unadjusted and
+  `adjusted_close` — matching `BarHourly`, and *not* `Bar5Min`, which is unadjusted and
   documented as such (`JDZG, 2026-03-23: $0.0928 against $20.925 the same day`).
   **`RawClose`** stores the unadjusted close beside it: `Close` keeps a series continuous
   across distributions, `RawClose` is the price that printed, and a candle body must read
-  both sides on one scale. It is `NULL` where not known (the `BarHourly` seed), and the
-  `/bars` cache-hit rule re-pulls a requested window from the vendor to fill it.
+  both sides on one scale. It is `NULL` where not known (the `BarHourly` seed, or a symbol
+  the 5-minute tape does not carry), and the `/bars` cache-hit rule re-pulls a requested
+  window from the vendor to fill it. `jobs.daily --fill-raw-close` fills it in bulk from
+  `Bar5Min` at no vendor cost.
+- **A `/bars` refresh keeps `MDS_HISTORY_SESSIONS` (560, ~2 years), not just the window the
+  caller asked for.** `/eod/` bills one unit whatever its width, so the depth is already
+  paid for; asking for fifteen sessions and keeping fifteen is how every symbol in the book
+  ended up averaging 55 rows against a five-year span. A symbol whose stored series already
+  reaches that horizon is refreshed for the requested sessions instead, so the fill is a
+  one-off per symbol rather than a rewrite on every daily refresh. The horizon is what makes
+  support and resistance levels computable from one call.
 - `TableDoc` / `ColumnDoc` rows are written for all three tables, following this database's
   own convention.
 
@@ -347,7 +356,7 @@ EXEC dbo.usp_MMDS_MaintainIndexes;               -- do it (offline: this is Stan
 ```
 
 Run it after a bulk change and weekly, outside the two collection windows (10:45 Sydney for the
-ASX, 02:15 for the US). `@IncludeWarehouse = 1` extends it to `BarHourly` / `BarReal5Min`,
+ASX, 02:15 for the US). `@IncludeWarehouse = 1` extends it to `BarHourly` / `Bar5Min`,
 which are otherwise left alone — a fullscan of 77 million rows is not a maintenance task.
 
 ### Expect ~27,700 rows per session, not ~2,800
@@ -555,11 +564,20 @@ python -m jobs.daily                       # latest session: 1 bulk call, 100 un
 python -m jobs.daily --since 2026-10-15    # every weekday since, to close a gap
 python -m jobs.daily --rebuild-indicators  # ATR only, no vendor call
 python -m jobs.daily --seed-from-barhourly --days 90   # FREE seed from BarHourly
+python -m jobs.daily --fill-raw-close      # FREE RawClose fill from Bar5Min, no vendor call
 ```
 
 **`--seed-from-barhourly` costs zero units** and is the right way to give ATR its first
-sessions: `Back_Test.BarHourly` already holds 13.4M split-adjusted bars that aggregate
+sessions: `BarHourly` already holds 13.4M split-adjusted bars that aggregate
 cleanly to sessions. Run it once before the first daily pull.
+
+**`--fill-raw-close` also costs zero units**, and is where the raw close comes from when it
+can: `Bar5Min` is the unadjusted 5-minute tape (81M bars, 2025-03-11 onward, 2,801 US
+symbols), so the last traded bar of each session is the close that printed — measured equal
+to `/eod/`'s `close` for AAPL and NVDA across fifteen sessions each. It fills only rows whose
+`RawClose IS NULL`, commits per 500 symbols, and skips a database that has no `Bar5Min`
+table. `BarHourly` cannot feed it: its `Close` is the split-adjusted series, which is what
+`DailySnapshot.Close` already holds.
 
 Two rules the job follows, both learned the hard way:
 
@@ -613,6 +631,7 @@ All by environment variable; defaults are the safe ones.
 | `MDS_PRICE_TTL_SECONDS` | `300` | price cache lifetime |
 | `MDS_BULK_BREAKEVEN` | `100` | symbols at which bulk beats per-symbol |
 | `MDS_MIN_SESSIONS` | `15` | sessions before ATR will answer |
+| `MDS_HISTORY_SESSIONS` | `560` | depth a vendor refresh asks for and keeps (~2 years) |
 | `MDS_ATR_PERIODS` | `14,20,22,26,50` | periods computed into IndicatorCache |
 | `MDS_ATR_METHOD` | `tr` | `tr` (the agreed standard) or `high_low` |
 | `MDS_ATR_SMOOTHING` | `simple` | `simple` or `wilder` |
@@ -884,6 +903,7 @@ python -m venv .venv
 
 .\run.ps1 -Schema     # create the three tables and their documentation rows
 .\run.ps1 -Seed       # free 90-day history seed from BarHourly
+.\run.ps1 -RawClose   # free RawClose fill from the Bar5Min tape
 .\run.ps1 -Daily      # one bulk pull + ATR rebuild
 .\run.ps1             # serve on 127.0.0.1:8003
 .\run.ps1 -Test       # 47 tests, no vendor units

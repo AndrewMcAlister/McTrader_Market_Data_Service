@@ -211,7 +211,7 @@ Completed daily bars.
 |---|---|
 | `as_of_session` | the last completed session in `rows` |
 | `adjusted` | whether `c` is split-adjusted |
-| `cr` | the **unadjusted** close; `null` means not known (a `BarHourly` seed, or a row not yet re-pulled). Candle bodies and order prices read this, never `c` on a series that says adjusted |
+| `cr` | the **unadjusted** close; `null` means not known (a `BarHourly` seed, or a row the 5-minute tape does not cover). Candle bodies and order prices read this, never `c` on a series that says adjusted. Filled in bulk from `Bar5Min` by `jobs.daily --fill-raw-close`, and per symbol by the `/bars` refresh |
 | `provider` | `cache` or the provider that answered (`eodhd`, `yahoo`, `binance`) |
 | `short_history` | symbols with fewer sessions than asked |
 
@@ -219,6 +219,12 @@ A cache hit requires a raw close on every served row. If any is missing the serv
 that symbol from the vendor once — one unit whatever the window — and the response's `fetched`
 names it. `allow_fetch: false` never refreshes, so a caller that wants raw closes must allow
 the fetch.
+
+A refresh also fills **depth**: while a symbol's stored series is shorter than
+`MDS_HISTORY_SESSIONS` (560 sessions, about two years), the request asks for that whole horizon
+and stores all of it. The same one unit buys it, so `sessions` only controls what is returned,
+not what is kept. A later request for more sessions is then answered from the database instead
+of the vendor — which is what makes support and resistance levels computable.
 
 `venue` chooses the series: the cache is keyed by `(symbol, exchange)`, so `AAPL` at
 `venue=AU` is a different instrument from `AAPL` at `venue=US`. A venue with a short series

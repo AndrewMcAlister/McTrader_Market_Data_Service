@@ -83,7 +83,7 @@ class ProviderBar:
 
     ``adjusted`` says whether the value is split-adjusted. It travels with the bar rather than
     being inferred at the call site because this database already carries both conventions and
-    documents the trap: ``BarReal5Min`` is unadjusted while ``BarHourly`` is, and a split shows
+    documents the trap: ``Bar5Min`` is unadjusted while ``BarHourly`` is, and a split shows
     as a jump (JDZG, 2026-03-23: $0.0928 against $20.925 the same day). An ATR mixing the two
     is silently wrong.
     """

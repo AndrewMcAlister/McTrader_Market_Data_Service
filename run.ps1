@@ -4,6 +4,7 @@
 #   .\run.ps1 -Daily       run the daily job once (bulk pull + indicator rebuild)
 #   .\run.ps1 -Test        run the test suite (spends no vendor units)
 #   .\run.ps1 -Schema      apply sql/001_schema.sql and report row counts
+#   .\run.ps1 -RawClose    fill RawClose from the Bar5Min tape (no vendor units)
 #
 # Everything runs from the project's own virtualenv; the service has no dependency on
 # McTrader's environment.
@@ -14,6 +15,8 @@ param(
     [switch]$Schema,
     [switch]$Seed,
     [int]$SeedDays = 90,
+    [switch]$RawClose,
+    [int]$RawCloseDays = 800,
     [string]$Since
 )
 
@@ -41,6 +44,10 @@ try {
     }
     if ($Seed) {
         & $python -m jobs.daily --seed-from-barhourly --days $SeedDays --rebuild-indicators
+        exit $LASTEXITCODE
+    }
+    if ($RawClose) {
+        & $python -m jobs.daily --fill-raw-close --raw-close-days $RawCloseDays --skip-indicators
         exit $LASTEXITCODE
     }
     if ($Daily) {

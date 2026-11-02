@@ -3,7 +3,8 @@
     python -m jobs.daily                     # the latest session (what the scheduler runs)
     python -m jobs.daily --date 2026-10-30   # a specific session
     python -m jobs.daily --seed-from-barhourly --days 90
-                                             # FREE history seed from Back_Test.BarHourly
+                                             # FREE history seed from BarHourly
+    python -m jobs.daily --fill-raw-close     # FREE RawClose fill from the Bar5Min tape
     python -m jobs.daily --rebuild-indicators # ATR only, no vendor call
 
 WHAT THIS COSTS
@@ -39,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from data_service import atr as atr_module
 from data_service import config as config_module
 from data_service.eodhd import EodhdClient, EodhdError, bare_symbol, normalise_venue
+from data_service.sessions import latest_completed_session
 from data_service.usage import Tariff, UsageLedger, set_caller
 from data_service.store import Store, _exchange_key, _float
 
@@ -247,6 +249,110 @@ def seed_from_barhourly(store: Store, days: int = 90, chunk: int = 20000,
 
 
 # ---------------------------------------------------------------------------
+# raw close from the 5-minute warehouse tape
+# ---------------------------------------------------------------------------
+
+#: The rows still missing a raw close, and the symbols worth touching. The symbol list is
+#: read from DailySnapshot rather than the warehouse: 1.7M rows aggregate in seconds, while
+#: a DISTINCT over the 81M-row tape is a full scan of it.
+RAW_CLOSE_CANDIDATES = """
+SELECT DISTINCT SymbolCode
+  FROM dbo.DailySnapshot
+ WHERE Exchange = ?
+   AND RawClose IS NULL
+   AND SnapshotDate >= ?
+   AND SnapshotDate <= ?
+"""
+
+#: The tape to read. The estate renamed ``BarReal5Min`` to ``Bar5Min`` on 2026-11-02; both
+#: are accepted so the job runs against a database at either side of that change.
+RAW_CLOSE_TAPES = ("Bar5Min", "BarReal5Min")
+
+#: The last *traded* bar of the session, by UTC date. The tape is unadjusted, so this is the
+#: close that printed; a zero close (a halt bar) is skipped rather than written as the price.
+RAW_CLOSE_FROM_BARS = """
+UPDATE d
+   SET RawClose = b.[Close]
+  FROM dbo.DailySnapshot d
+  CROSS APPLY (SELECT TOP (1) x.[Close]
+                 FROM dbo.{table} x
+                WHERE x.SymbolCode = d.SymbolCode
+                  AND x.Exchange = d.Exchange
+                  AND x.BarTimeUtc >= CAST(d.SnapshotDate AS datetime2)
+                  AND x.BarTimeUtc <  DATEADD(day, 1, CAST(d.SnapshotDate AS datetime2))
+                  AND x.[Close] > 0
+                ORDER BY x.BarTimeUtc DESC) b
+ WHERE d.Exchange = ?
+   AND d.RawClose IS NULL
+   AND d.SnapshotDate >= ?
+   AND d.SnapshotDate <= ?
+   AND d.SymbolCode IN ({placeholders})
+"""
+
+
+def fill_raw_close_from_bars(store: Store, days: int = 800, chunk: int = 500,
+                             market: str = "US") -> Dict[str, Any]:
+    """Fill ``DailySnapshot.RawClose`` from the Bar5Min tape. Costs no vendor units.
+
+    WHY THE 5-MINUTE TAPE AND NOT THE HOURLY ONE
+
+    ``Bar5Min`` is unadjusted: its ``Close`` is the price that printed, so the last traded
+    bar of a session is that session's raw close. It is the same number ``/eod/`` returns as
+    ``close`` -- checked against the vendor for AAPL and NVDA over fifteen sessions each,
+    exact to the last decimal. ``BarHourly``'s ``Close`` is the split-adjusted series, which
+    is what ``DailySnapshot.Close`` already holds; filling ``RawClose`` from it would write
+    the adjusted value into the one column that exists to keep the two apart.
+
+    Only ``RawClose IS NULL`` rows are touched, so this is re-runnable and never overwrites a
+    value the vendor supplied. Chunked by symbol and committed per chunk: one million-row
+    transaction would hold locks on the serving path -- the same reason ``upsert_daily``
+    stages its writes.
+    """
+    exchange = _exchange_key(normalise_venue(market), required=True)
+    until = latest_completed_session(market)
+    since = until - timedelta(days=max(1, days))
+    conn = store.connect()
+    try:
+        cursor = conn.cursor()
+        table = None
+        for name in RAW_CLOSE_TAPES:
+            if cursor.execute("SELECT OBJECT_ID(?, 'U')", f"dbo.{name}").fetchone()[0]:
+                table = name
+                break
+        if table is None:
+            log.warning("no 5-minute tape (%s) in this database; nothing to fill from",
+                        " or ".join(RAW_CLOSE_TAPES))
+            return {"updated": 0, "symbols": 0, "since": since, "skipped": "no-5min-tape"}
+        cursor.execute(RAW_CLOSE_CANDIDATES, exchange, since, until)
+        symbols = [str(row[0]).strip().upper() for row in cursor.fetchall()]
+    finally:
+        conn.close()
+
+    log.info("%d symbol(s) with a missing raw close since %s (%s), filling from dbo.%s",
+             len(symbols), since, exchange, table)
+
+    updated = 0
+    for start in range(0, len(symbols), chunk):
+        batch = symbols[start:start + chunk]
+        placeholders = ",".join("?" * len(batch))
+        conn = store.connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                RAW_CLOSE_FROM_BARS.format(table=table, placeholders=placeholders),
+                exchange, since, until, *batch)
+            updated += max(0, int(cursor.rowcount))
+            conn.commit()
+        finally:
+            conn.close()
+        log.info("  raw close filled %d/%d symbols, %d row(s)",
+                 min(start + chunk, len(symbols)), len(symbols), updated)
+
+    return {"updated": updated, "symbols": len(symbols), "since": since, "until": until,
+            "table": table}
+
+
+# ---------------------------------------------------------------------------
 # indicator rebuild
 # ---------------------------------------------------------------------------
 
@@ -336,6 +442,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="Free history seed from Back_Test.BarHourly (no vendor units)")
     parser.add_argument("--days", type=int, default=90,
                         help="How far back to seed (default 90 calendar days)")
+    parser.add_argument("--fill-raw-close", action="store_true",
+                        help="Fill DailySnapshot.RawClose from the Bar5Min tape "
+                             "(no vendor units)")
+    parser.add_argument("--raw-close-days", type=int, default=800,
+                        help="How far back the raw-close fill reaches (default 800)")
     parser.add_argument("--rebuild-indicators", action="store_true",
                         help="Recompute IndicatorCache and exit (no vendor call)")
     parser.add_argument("--skip-indicators", action="store_true",
@@ -371,7 +482,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.seed_from_barhourly:
         summary["seed"] = seed_from_barhourly(store, days=args.days, market=args.market)
 
-    if not args.rebuild_indicators:
+    if args.fill_raw_close:
+        summary["raw_close"] = fill_raw_close_from_bars(
+            store, days=args.raw_close_days, market=args.market)
+
+    # A fill is a local backfill, not a reason to spend 100 units on the day's bulk pull.
+    if not (args.rebuild_indicators or args.fill_raw_close):
         if settings.eodhd_api_key:
             client = EodhdClient(
                 api_key=settings.eodhd_api_key,

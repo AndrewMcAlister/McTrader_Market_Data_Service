@@ -41,7 +41,7 @@
  * must state it, and a write that does not is refused rather than filed as US.
  *
  * IsAdjusted exists because the warehouse already carries both conventions and documents
- * the trap: BarReal5Min is NOT split-adjusted while BarHourly is, and a split shows as a
+ * the trap: Bar5Min is NOT split-adjusted while BarHourly is, and a split shows as a
  * jump (JDZG, 2026-03-23: $0.0928 against $20.925 the same day). An ATR mixing the two
  * is silently wrong, so every row states which it is.
  *
@@ -164,7 +164,7 @@ IF NOT EXISTS (SELECT 1 FROM dbo.TableDoc WHERE TableName = 'DailySnapshot')
     INSERT INTO dbo.TableDoc (TableName, Grain, Purpose, RowCountNote, DataSource)
     VALUES ('DailySnapshot',
             'one row per symbol per venue per session',
-            'Daily OHLCV, appended once per session by D:\McTrader_Market_Data_Service from EODHD /eod-bulk-last-day. Close is adjusted_close where the vendor supplies it (IsAdjusted=1), matching BarHourly''s convention and never mixed with BarReal5Min, which is unadjusted. RawClose is the unadjusted close and may be NULL where it is not known (the BarHourly seed). This is the series ATR is computed from; IndicatorCache holds the result.',
+            'Daily OHLCV, appended once per session by D:\McTrader_Market_Data_Service from EODHD /eod-bulk-last-day. Close is adjusted_close where the vendor supplies it (IsAdjusted=1), matching BarHourly''s convention and never mixed with Bar5Min, which is unadjusted. RawClose is the unadjusted close and may be NULL where it is not known (the BarHourly seed). This is the series ATR is computed from; IndicatorCache holds the result.',
             'universe x sessions', 'measured');
 GO
 
@@ -215,7 +215,7 @@ IF NOT EXISTS (SELECT 1 FROM dbo.ColumnDoc WHERE TableName = 'DailySnapshot' AND
     INSERT INTO dbo.ColumnDoc (TableName, ColumnName, DataType, Unit, Meaning, Notes)
     VALUES ('DailySnapshot', 'IsAdjusted', 'bit', 'flag',
             '1 = Close is split-adjusted (EODHD adjusted_close); 0 = Close is the raw close.',
-            'Never mix 1 and 0 rows in one ATR: a split reads as a catastrophic move. Matches BarHourly (adjusted), not BarReal5Min (unadjusted). RawClose is independent of this flag and is always the traded close.');
+            'Never mix 1 and 0 rows in one ATR: a split reads as a catastrophic move. Matches BarHourly (adjusted), not Bar5Min (unadjusted). RawClose is independent of this flag and is always the traded close.');
 GO
 
 IF NOT EXISTS (SELECT 1 FROM dbo.ColumnDoc WHERE TableName = 'DailySnapshot' AND ColumnName = 'RawClose')
@@ -401,7 +401,7 @@ IF COL_LENGTH('dbo.DailySnapshot', 'RawClose') IS NULL
 GO
 
 UPDATE dbo.TableDoc
-   SET Purpose = 'Daily OHLCV, appended once per session by D:\McTrader_Market_Data_Service from EODHD /eod-bulk-last-day. Close is adjusted_close where the vendor supplies it (IsAdjusted=1), matching BarHourly''s convention and never mixed with BarReal5Min, which is unadjusted. RawClose is the unadjusted close and may be NULL where it is not known (the BarHourly seed). This is the series ATR is computed from; IndicatorCache holds the result.'
+   SET Purpose = 'Daily OHLCV, appended once per session by D:\McTrader_Market_Data_Service from EODHD /eod-bulk-last-day. Close is adjusted_close where the vendor supplies it (IsAdjusted=1), matching BarHourly''s convention and never mixed with Bar5Min, which is unadjusted. RawClose is the unadjusted close and may be NULL where it is not known (the BarHourly seed). This is the series ATR is computed from; IndicatorCache holds the result.'
  WHERE TableName = 'DailySnapshot'
    AND Purpose NOT LIKE '%RawClose%';
 GO
