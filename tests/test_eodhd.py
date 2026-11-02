@@ -16,6 +16,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from data_service.eodhd import (
+    MAX_RATE_LIMIT_RETRIES,
+    EodhdClient,
     EodhdError,
     bare_symbol,
     normalise_venue,
@@ -84,3 +86,123 @@ def test_bare_symbol_strips_one_known_suffix():
 def test_class_shares_keep_their_dot_after_the_venue_is_stripped():
     """BRK.B.US is BRK in the bulk feed's vocabulary; that is the vendor's convention, not ours."""
     assert render_symbol("BRK.B", "US").endswith(".US")
+
+
+# ---------------------------------------------------------------------------
+# intraday
+# ---------------------------------------------------------------------------
+
+class _Response:
+    status_code = 200
+
+    @staticmethod
+    def json():
+        return [{"timestamp": 1_758_029_400, "open": 1, "high": 2, "low": 0.5, "close": 1.5}]
+
+
+class _Session:
+    def __init__(self):
+        self.calls = []
+
+    def get(self, url, params, timeout):
+        self.calls.append((url, dict(params), timeout))
+        return _Response()
+
+
+def test_intraday_asks_with_epoch_seconds_and_the_venue_suffix():
+    """A date-string window is HTTP 422; epoch is the shape the endpoint accepts."""
+    session = _Session()
+    client = EodhdClient(api_key="k", session=session)
+    start = 1_700_000_000
+    client.intraday("BHP", "AU", start=start, end=start + 400 * 86400)
+
+    url, params, _ = session.calls[0]
+    assert url.endswith("/intraday/BHP.AU")
+    assert params["interval"] == "5m"
+    assert params["from"] == start
+    assert params["to"] == start + 400 * 86400
+    assert "api_token" in params
+    assert client.units == 5
+
+
+def test_intraday_refuses_a_window_wider_than_the_vendor_accepts():
+    client = EodhdClient(api_key="k", session=_Session())
+    with pytest.raises(EodhdError) as exc:
+        client.intraday("BHP", "US", start=1, end=1 + 601 * 86400)
+    assert exc.value.reason == "window-too-wide"
+
+
+def test_intraday_refuses_a_window_without_a_start():
+    client = EodhdClient(api_key="k", session=_Session())
+    with pytest.raises(EodhdError) as exc:
+        client.intraday("BHP", "US", start=0, end=1_700_000_000)
+    assert exc.value.reason == "empty-window"
+
+
+# ---------------------------------------------------------------------------
+# billing: 429 is a refusal, 404 is a billed answer
+# ---------------------------------------------------------------------------
+
+class _NotFoundResponse:
+    status_code = 404
+    headers = {}
+    text = "not found"
+
+    @staticmethod
+    def json():
+        return {}
+
+
+class _RateLimitedResponse:
+    status_code = 429
+    headers = {"Retry-After": "0"}
+    text = "429 Too Many Requests"
+
+    @staticmethod
+    def json():
+        return {}
+
+
+class _SequenceSession:
+    """A session that answers with a fixed sequence, so retries are observable."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def get(self, url, params, timeout):
+        self.calls.append((url, dict(params), timeout))
+        return self.responses.pop(0)
+
+
+def test_a_429_is_retried_and_not_billed():
+    """The vendor refused before processing, so the retry is free and the call succeeds."""
+    session = _SequenceSession([_RateLimitedResponse(), _Response()])
+    client = EodhdClient(api_key="k", session=session)
+    client.eod("AAPL", "US")
+
+    assert len(session.calls) == 2
+    assert client.units == 1
+
+
+def test_a_persistent_429_stops_at_the_cap_and_is_still_unbilled():
+    session = _SequenceSession([_RateLimitedResponse()] * (MAX_RATE_LIMIT_RETRIES + 1))
+    client = EodhdClient(api_key="k", session=session)
+    with pytest.raises(EodhdError) as exc:
+        client.eod("AAPL", "US")
+
+    assert exc.value.reason == "rate-limited"
+    assert len(session.calls) == MAX_RATE_LIMIT_RETRIES + 1
+    assert client.units == 0
+
+
+def test_a_billed_404_is_not_retried_and_is_recorded():
+    """A malformed request was processed and billed; retrying it pays twice for one mistake."""
+    session = _SequenceSession([_NotFoundResponse()])
+    client = EodhdClient(api_key="k", session=session)
+    with pytest.raises(EodhdError) as exc:
+        client.eod("AAPL", "US")
+
+    assert exc.value.reason == "http-error"
+    assert len(session.calls) == 1
+    assert client.units == 1

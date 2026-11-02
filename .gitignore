@@ -25,6 +25,7 @@ dist/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+tools/.cache/
 
 # A stray PowerShell error transcript from an earlier failed command; not source.
 2026-10-14

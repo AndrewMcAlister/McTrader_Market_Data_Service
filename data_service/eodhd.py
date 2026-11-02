@@ -7,14 +7,16 @@ Everything the service needs from the vendor is one of four requests:
 | one symbol's latest price  | ``/real-time/{SYM}.{EX}``                        | 1/symbol    |
 | the whole US market        | ``/real-time/{placeholder}.US?ex=US``            | 100 flat    |
 | one symbol's daily history | ``/eod/{SYM}.{EX}?from=...&period=d``            | 1 flat      |
+| one symbol's intraday bars | ``/intraday/{SYM}.{EX}?interval=5m&from=...``    | 5 flat      |
 | one session, whole market  | ``/eod-bulk-last-day/{MARKET}?date=YYYY-MM-DD``  | 100 flat    |
 
 Two facts about the tariff drive the code:
 
 1. **A rejected request is still billed** (measured: a 404 from ``/eod/`` cost 1 unit, a 404
    from ``/intraday/`` cost 5). So a 4xx is never retried -- retrying a malformed request
-   pays again for the same mistake. Only a transport failure (connection, timeout) is
-   retried, once.
+   pays again for the same mistake. The one exception is 429: a rate-limit refusal is not
+   a request the vendor processed, so it is neither billed nor a mistake. It is waited out
+   and retried, honouring ``Retry-After`` when the vendor sends one.
 2. **``/eod/`` is flat regardless of window**, so the history call asks for the whole window
    it needs in one request rather than paging.
 
@@ -67,6 +69,23 @@ BULK_REAL_TIME_VENUE = "US"
 #: The path ticker for the ``ex=`` form. EODHD ignores it once ``ex`` is set; it is present
 #: because the path is not optional. Fixed, so no caller's symbol can end up in it.
 BULK_PLACEHOLDER = "AAPL"
+
+#: A 429 means the vendor refused the request before doing any work. It is not billed, so
+#: retrying it costs nothing but time. The cap keeps a sustained rate-limit from hanging a
+#: caller forever; the backfill also throttles itself so this is a safety net, not the plan.
+MAX_RATE_LIMIT_RETRIES = 6
+
+
+def _retry_after_seconds(response: Any, attempt: int) -> float:
+    """How long to wait after a 429: the vendor's ``Retry-After`` if sane, else backoff."""
+    headers = getattr(response, "headers", None) or {}
+    raw = headers.get("Retry-After")
+    if raw is not None:
+        try:
+            return max(0.0, min(float(raw), 60.0))
+        except (TypeError, ValueError):
+            pass
+    return min(2.0 ** (attempt - 1), 30.0)
 
 
 class EodhdError(RuntimeError):
@@ -183,13 +202,14 @@ class EodhdClient:
         url = f"{self.base_url}/{path}"
         leash = timeout if timeout is not None else self.timeout_seconds
 
-        last: Optional[Exception] = None
-        for attempt in (1, 2):
+        transport_attempt = 0
+        rate_limit_attempt = 0
+        while True:
             try:
                 response = self.session.get(url, params=query, timeout=leash)
             except requests.RequestException as exc:
-                last = exc
-                if attempt == 1:
+                transport_attempt += 1
+                if transport_attempt < 2:
                     time.sleep(0.5)
                     continue
                 raise EodhdError("transport", f"{type(exc).__name__}: {exc}") from exc
@@ -204,16 +224,27 @@ class EodhdClient:
                 self._spent(purpose, units, symbols)
                 return payload
 
+            if response.status_code == 429:
+                # Refused before processing, so not billed. Retry after the window the vendor
+                # states; a blind immediate retry would just be refused again.
+                rate_limit_attempt += 1
+                if rate_limit_attempt > MAX_RATE_LIMIT_RETRIES:
+                    raise EodhdError(
+                        "rate-limited",
+                        f"HTTP 429 after {MAX_RATE_LIMIT_RETRIES} retries for /{path}",
+                        status=429)
+                time.sleep(_retry_after_seconds(response, rate_limit_attempt))
+                continue
+
             # 4xx/5xx: billed, so no retry -- and billed, so it is recorded before raising.
             # Measured: a 404 from /eod/ cost 1 and a 404 from /intraday/ cost 5. A transport
-            # failure below is the one case that costs nothing, because the request never landed.
+            # failure above is the one other case that costs nothing, because the request never
+            # landed; a 429 above costs nothing because the vendor refused to process it.
             self._spent(purpose, units, symbols)
             raise EodhdError(
                 "http-error",
                 f"HTTP {response.status_code} for /{path}: {response.text[:200]}",
                 status=response.status_code)
-
-        raise EodhdError("transport", str(last) if last else "unknown transport failure")
 
     # -- the four calls ----------------------------------------------------
 
@@ -270,6 +301,45 @@ class EodhdClient:
             purpose="eod",
             units=1,
             symbols=1,
+        )
+        if not isinstance(payload, list):
+            raise EodhdError("unparseable", f"expected a list, got {type(payload).__name__}")
+        return payload
+
+    def intraday(self, symbol: str, venue: str = "US", interval: str = "5m",
+                 start: int = 0, end: int = 0) -> List[Dict[str, Any]]:
+        """One symbol's intraday bars, oldest first. Billed 5 flat per call.
+
+        ``start`` and ``end`` are epoch seconds, not dates: the vendor rejects a
+        date-string window with HTTP 422 ("Unprocessable Content"), which reads like a
+        range problem and is not one. The 5m interval accepts at most 600 days in one
+        request; a wider window is refused rather than silently truncated.
+
+        The suffix is rendered from ``venue`` (``render_symbol``), so ``BHP`` at ``AU``
+        asks for ``BHP.AU`` and cannot be resolved by the vendor's bare-ticker default.
+        """
+        from datetime import datetime, timezone
+
+        ticker = render_symbol(symbol, venue)
+        now = int(datetime.now(timezone.utc).timestamp())
+        end = int(end or now)
+        if not start:
+            raise EodhdError(
+                "empty-window",
+                "intraday needs an explicit epoch start; a default would hide a caller "
+                "asking for the wrong range")
+        if end - start > 600 * 86400:
+            raise EodhdError(
+                "window-too-wide",
+                f"5m intraday accepts at most 600 days; the request spans "
+                f"{(end - start) / 86400:.1f} days")
+        payload = self._get(
+            f"intraday/{ticker}",
+            {"interval": interval, "from": int(start), "to": int(end)},
+            purpose="intraday",
+            units=5,
+            symbols=1,
+            timeout=self.bulk_timeout_seconds,
         )
         if not isinstance(payload, list):
             raise EodhdError("unparseable", f"expected a list, got {type(payload).__name__}")

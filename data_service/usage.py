@@ -42,6 +42,7 @@ PURPOSE_REQUEST_TYPE: Dict[str, str] = {
     "real_time_bulk": "/real-time?ex=US",
     "eod": "/eod/",
     "eod_bulk": "/eod-bulk-last-day/US",
+    "intraday": "/intraday/",
 }
 
 #: What a call becomes when no tariff row matches it. It still gets a row: an unpriced call is a
