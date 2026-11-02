@@ -171,14 +171,20 @@ class EodhdClient:
         self.calls[purpose] = self.calls.get(purpose, 0) + 1
         self.units += units
 
-    def _spent(self, purpose: str, units: int, symbols: int = 0) -> None:
+    def _spent(self, purpose: str, units: int, symbols: int = 0,
+               request_type: Optional[str] = None) -> None:
         """Count one billable call, priced from the tariff when a recorder is attached.
 
         The tariff wins over the literal ``units`` because dbo.RequestTypes carries the measurement
         and its evidence: a re-measured price should be a row update, not a code change.
+
+        ``request_type`` overrides the purpose's default for a call whose tariff row depends on
+        what was asked rather than only on which endpoint was called: a bulk pull for the ASX is
+        ``/eod-bulk-last-day/AU``, and filing it under the US row is how the per-market freshness
+        check ends up reading another market's spend.
         """
         cost = units
-        request_type = PURPOSE_REQUEST_TYPE.get(purpose)
+        request_type = request_type or PURPOSE_REQUEST_TYPE.get(purpose)
         if self.recorder is not None and request_type:
             try:
                 priced = self.recorder(request_type, symbols)
@@ -189,7 +195,8 @@ class EodhdClient:
         self._count(purpose, cost)
 
     def _get(self, path: str, params: Dict[str, Any], *, purpose: str,
-             units: int, symbols: int = 0, timeout: Optional[float] = None) -> Any:
+             units: int, symbols: int = 0, timeout: Optional[float] = None,
+             request_type: Optional[str] = None) -> Any:
         """One GET, at most one retry, and never on a 4xx.
 
         A 4xx is billed, so retrying it pays twice for the same rejected question. Only a
@@ -221,7 +228,7 @@ class EodhdClient:
                     raise EodhdError(
                         "unparseable", f"200 with a non-JSON body ({exc})",
                         status=200) from exc
-                self._spent(purpose, units, symbols)
+                self._spent(purpose, units, symbols, request_type)
                 return payload
 
             if response.status_code == 429:
@@ -240,7 +247,7 @@ class EodhdClient:
             # Measured: a 404 from /eod/ cost 1 and a 404 from /intraday/ cost 5. A transport
             # failure above is the one other case that costs nothing, because the request never
             # landed; a 429 above costs nothing because the vendor refused to process it.
-            self._spent(purpose, units, symbols)
+            self._spent(purpose, units, symbols, request_type)
             raise EodhdError(
                 "http-error",
                 f"HTTP {response.status_code} for /{path}: {response.text[:200]}",
@@ -354,15 +361,20 @@ class EodhdClient:
         for the current session -- so a dated pull must be intersected with the current
         session's codes rather than read alone.
         """
+        market = normalise_venue(market)
         params: Dict[str, Any] = {}
         if session_date:
             params["date"] = session_date
         payload = self._get(
-            f"eod-bulk-last-day/{normalise_venue(market)}",
+            f"eod-bulk-last-day/{market}",
             params,
             purpose="eod_bulk",
             units=100,
             symbols=0,
+            # The tariff row names the market, so the ledger -- and refresh.is_fresh, which
+            # reads it -- can tell an AU pull from a US one. Before this, every bulk pull
+            # was filed as /US and an AU refresh never looked fresh.
+            request_type=f"/eod-bulk-last-day/{market}",
             timeout=self.bulk_timeout_seconds,
         )
         if not isinstance(payload, list):

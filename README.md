@@ -707,6 +707,13 @@ session. The guard is at the point of collection, not only on the timer: nothing
 the venue's session, including from a manual run — a price collected at 02:00 on a Sunday is a stale
 echo or a synthetic print, and either is what a screener should not be ranking on.
 
+What a run collects depends on the venue. The US gets the whole-market snapshot (one call, 100
+units). The ASX has no whole-market real-time feed, so its run is the settled daily bulk **plus**
+live prices for the top 100 listings by dollar volume on the last settled session
+(`MDS_SCHEDULE_PRICE_UNIVERSE`, one unit a symbol). That second part is what writes an observation
+after the open into `SymbolPriceCache` — the only table `GET /todays-data-is-available` reads — so
+without it the AU answer could never be true.
+
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8003/schedule    # what it is, and what it did
 Invoke-RestMethod -Method Post 'http://127.0.0.1:8003/schedule/run?market=AU'   # run one now

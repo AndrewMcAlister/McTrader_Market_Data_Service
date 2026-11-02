@@ -206,3 +206,60 @@ def test_a_billed_404_is_not_retried_and_is_recorded():
     assert exc.value.reason == "http-error"
     assert len(session.calls) == 1
     assert client.units == 1
+
+
+# ---------------------------------------------------------------------------
+# bulk billing: the ledger row names the market that was asked
+# ---------------------------------------------------------------------------
+
+class _BulkResponse:
+    status_code = 200
+
+    @staticmethod
+    def json():
+        return [{"code": "BHP.AU", "date": "2026-10-30", "open": 1, "high": 2,
+                 "low": 0.5, "close": 1.5, "adjusted_close": 1.5, "volume": 10}]
+
+
+def _bulk_client(responses):
+    session = _SequenceSession(responses)
+    recorded = []
+
+    def recorder(request_type, symbols):
+        recorded.append((request_type, symbols))
+        return 100
+
+    client = EodhdClient(api_key="k", session=session)
+    client.recorder = recorder
+    return client, session, recorded
+
+
+def test_an_au_bulk_pull_is_recorded_under_the_au_market():
+    """Filing every pull as /US is what made is_fresh("AU") permanently false, so each
+    restart re-spent 100 units on a session the ledger said nothing about."""
+    client, session, recorded = _bulk_client([_BulkResponse()])
+
+    client.bulk_last_day("AU")
+
+    assert session.calls[0][0].endswith("/eod-bulk-last-day/AU")
+    assert recorded == [("/eod-bulk-last-day/AU", 0)]
+    assert client.units == 100
+
+
+def test_a_us_bulk_pull_keeps_its_own_ledger_row():
+    client, session, recorded = _bulk_client([_BulkResponse()])
+
+    client.bulk_last_day("US")
+
+    assert session.calls[0][0].endswith("/eod-bulk-last-day/US")
+    assert recorded == [("/eod-bulk-last-day/US", 0)]
+
+
+def test_a_billed_bulk_failure_is_recorded_under_the_market_asked():
+    """A rejected request is still billed, so it must land on the right market's row."""
+    client, _, recorded = _bulk_client([_NotFoundResponse()])
+
+    with pytest.raises(EodhdError):
+        client.bulk_last_day("AU")
+
+    assert recorded == [("/eod-bulk-last-day/AU", 0)]

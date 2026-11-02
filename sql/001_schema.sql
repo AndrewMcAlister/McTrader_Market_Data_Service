@@ -396,3 +396,31 @@ BEGIN
             'Part of the primary key. An ATR is a property of one venue''s series: mixing an ASX bar into a US series reads the currency difference as a move, and a symbol-only key would serve whichever row the database returned first.');
 END
 GO
+
+/* The ASX bulk pull gets its own tariff row.
+
+   dbo.EODHDUsage is keyed by RequestType, and refresh.is_fresh("AU") reads the row named
+   /eod-bulk-last-day/AU. Before this row existed the client filed every bulk pull as /US,
+   so an AU refresh never looked fresh and every restart re-spent 100 units.
+
+   The price is carried from the same endpoint measured flat at 100 across US 50,234, LSE
+   7,082 and AS 527 rows -- a 95x spread in row count, all +100, so it is per call rather
+   than per row. AU itself was not in that run, so Is_Estimated is 1 until one AU pull is
+   reconciled against the vendor's free /user counter, at which point it flips to 0.
+
+   The INSERT is dynamic because dbo.RequestTypes is an estate table this script does not
+   create: naming it in the batch itself would fail to compile on a database without it,
+   where the service otherwise runs (recording the call at cost 0, with a warning). */
+
+IF OBJECT_ID('dbo.RequestTypes', 'U') IS NOT NULL
+    EXEC sp_executesql N'
+        IF NOT EXISTS (SELECT 1 FROM dbo.RequestTypes WHERE RequestType = N''/eod-bulk-last-day/AU'')
+            INSERT INTO dbo.RequestTypes
+                (RequestType, Endpoint, CostBasis, CostEach, MeasuredAt, Evidence, Note, Is_Estimated)
+            VALUES
+                (N''/eod-bulk-last-day/AU'', N''/eod-bulk-last-day/{market}'', N''flat'', 100,
+                 ''2026-10-17'',
+                 N''Carried from the same endpoint measured flat at 100 across US 50,234, LSE 7,082 and AS 527 rows; an AU pull itself was not in that run.'',
+                 N''Separate from /eod-bulk-last-day/US so EODHDUsage names the market that was pulled and refresh.is_fresh(AU) reads the AU row rather than the US one.'',
+                 1);';
+GO

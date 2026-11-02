@@ -702,6 +702,54 @@ class Store:
         finally:
             conn.close()
 
+    def top_symbols_by_dollar_volume(self, venue: str, limit: int = 100,
+                                     min_breadth: int = 50) -> List[str]:
+        """The venue's most-traded symbols by dollar volume on its newest broad session.
+
+        ``min_breadth`` is what makes "newest" mean "newest session the market actually
+        traded". A single-symbol ``/bars`` write lands in DailySnapshot carrying today's
+        date while the market-wide pull is still on the previous session, so a plain
+        MAX(SnapshotDate) would rank a handful of codes. A session counts once at least
+        ``min_breadth`` symbols have a bar for it: the ASX's market-wide pulls carry ~2,300
+        and the thinnest real ones measured ~300, while a stray single-symbol row cannot
+        reach the floor.
+
+        At an open + 45 run the newest broad session is the last settled one -- Friday on a
+        Monday -- which is the right seed: today's bars are still in progress and cannot be
+        ranked. Codes are bare symbols, the vocabulary ``pull_bulk`` writes.
+
+        Returns ``[]`` when no session is broad enough or ``limit`` is not positive, so a
+        caller can treat "no universe" as a named outcome instead of pricing nothing.
+        """
+        limit = max(0, int(limit))
+        if limit == 0:
+            return []
+        sql = """
+            WITH broad AS (
+                SELECT SnapshotDate
+                  FROM dbo.DailySnapshot
+                 WHERE Exchange = ?
+                 GROUP BY SnapshotDate
+                HAVING COUNT(*) >= ?
+            ), newest AS (
+                SELECT TOP (1) SnapshotDate FROM broad ORDER BY SnapshotDate DESC
+            )
+            SELECT TOP (?) SymbolCode
+              FROM dbo.DailySnapshot d
+              JOIN newest n ON n.SnapshotDate = d.SnapshotDate
+             WHERE d.Exchange = ?
+               AND d.[Close] > 0
+               AND d.Volume > 0
+             ORDER BY d.[Close] * d.Volume DESC
+        """
+        conn = self.connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(sql, venue, max(1, int(min_breadth)), limit, venue)
+            return [row[0] for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
     def usage_summary(self, usage_date: Optional[date] = None) -> Dict[str, Any]:
         """The day's spend from the ledger: totals, and the breakdowns that explain them."""
         day = usage_date or _local_today()

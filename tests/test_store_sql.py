@@ -277,3 +277,39 @@ def test_the_database_does_not_default_the_venue():
     assert len(venue_columns) == 3, f"expected three venue columns, found {venue_columns}"
     for line in venue_columns:
         assert "DEFAULT" not in line.upper(), f"the venue is defaulted: {line}"
+
+
+# ---------------------------------------------------------------------------
+# the price universe: a broad session first, then dollar volume
+# ---------------------------------------------------------------------------
+
+def test_the_universe_binds_venue_breadth_and_limit_in_order():
+    connection = FakeConnection(rows=[("BHP",), ("CBA",), ("COL",)])
+    store = store_against(connection)
+
+    symbols = store.top_symbols_by_dollar_volume("AU", limit=3, min_breadth=50)
+
+    assert symbols == ["BHP", "CBA", "COL"]
+    sql, params = connection.executed[0]
+    assert "HAVING COUNT(*) >= ?" in sql
+    assert params == ("AU", 50, 3, "AU")
+
+
+def test_the_universe_is_ranked_by_dollar_volume():
+    connection = FakeConnection()
+    store = store_against(connection)
+
+    store.top_symbols_by_dollar_volume("AU", limit=10)
+
+    sql, _ = connection.executed[0]
+    assert "d.[Close] * d.Volume DESC" in sql
+    assert "d.[Close] > 0" in sql and "d.Volume > 0" in sql
+
+
+def test_a_non_positive_limit_prices_no_universe():
+    """'No universe' is a named outcome, not an empty POST /prices that raises."""
+    connection = FakeConnection(rows=[("BHP",)])
+    store = store_against(connection)
+
+    assert store.top_symbols_by_dollar_volume("AU", limit=0) == []
+    assert connection.executed == []

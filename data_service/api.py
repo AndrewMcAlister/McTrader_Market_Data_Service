@@ -177,6 +177,45 @@ def build_products(settings: config_module.Settings, store: Store) -> Any:
         return None
 
 
+def _price_venue_universe(*, products: Any, store: Store, venue: str,
+                          limit: int, clock: Any) -> Dict[str, Any]:
+    """Price a venue's most-traded universe and answer the availability question.
+
+    A venue with no whole-market real-time feed has no other way to put a post-open
+    observation into SymbolPriceCache: EODHD publishes that feed for the US only and
+    refuses the rest (eodhd.py:261-284), and the availability check reads that table and
+    nothing else. The seed is the top of the last settled session by dollar volume, so it
+    needs no configured list and is the set the books actually rank.
+
+    ``products.prices`` takes the per-symbol route for a non-US venue -- the bulk route is
+    US-only (products.py:289) -- at one vendor unit a symbol. Missing symbols are reported
+    rather than fatal: a name the vendor cannot price does not make the venue's data absent.
+    """
+    from .availability import check
+
+    symbols = store.top_symbols_by_dollar_volume(venue, limit)
+    if not symbols:
+        return {"venue": venue, "universe": 0, "available": False,
+                "reason": "no-universe"}
+
+    batch = products.prices(symbols, venue=venue)
+    verdict = check(clock, store.latest_venue_price(venue), venue)
+    return {
+        "venue": venue,
+        "universe": len(symbols),
+        "requested": batch.get("requested"),
+        # `count` is every symbol with a quote, cache hits included; `fetched` is only the
+        # ones this call bought from the vendor. A retry inside the five-minute TTL prices
+        # the universe with fetched=0, and reporting that as "priced 0" would read as a
+        # failure when it is the opposite.
+        "priced": batch.get("count"),
+        "fetched": len(batch.get("fetched") or ()),
+        "missing": len(batch.get("missing") or ()),
+        "available": bool(verdict.available),
+        "latest_price_utc": verdict.latest_utc.isoformat() if verdict.latest_utc else None,
+    }
+
+
 def _build_schedule(app: FastAPI, settings: Any):
     """The collection schedule, wired to the same store and vendor client as the endpoints.
 
@@ -200,13 +239,17 @@ def _build_schedule(app: FastAPI, settings: Any):
         retry_minutes=settings.schedule_retry_minutes)
 
     def run_market(market: str) -> Dict[str, Any]:
-        """Collect one venue's bulk data -- but only while that venue is open.
+        """Collect one venue's data -- but only while that venue is open.
 
         The guard is here, at the point of collection, and not only on the schedule: a
         manual /schedule/run must obey the same rule or the rule is decorative. The bars
         this writes are the previous session's settled bar (a bulk daily endpoint cannot
-        answer with a bar that has not closed); the snapshot it writes is live, which is
+        answer with a bar that has not closed); the prices it writes are live, which is
         exactly the data the session guard exists to protect.
+
+        US is one whole-market snapshot. Every other venue gets a bounded per-symbol
+        universe, because no whole-market real-time feed exists for it -- and without one
+        ``/todays-data-is-available`` could never be true for that venue.
         """
         window = windows.get(market)
         if window is None:
@@ -230,6 +273,26 @@ def _build_schedule(app: FastAPI, settings: Any):
                 result["snapshot_rows"] = products.refresh_snapshot("US")
             except Exception as exc:  # noqa: BLE001 - a snapshot failure is reported, not fatal
                 result["snapshot_error"] = f"{type(exc).__name__}: {exc}"
+        else:
+            try:
+                pricing = _price_venue_universe(
+                    products=products, store=store, venue=market,
+                    limit=settings.schedule_price_universe,
+                    clock=session_schedule.clock)
+            except Exception as exc:  # noqa: BLE001 - reported, not fatal to the run
+                pricing = {"venue": market, "available": False,
+                           "error": f"{type(exc).__name__}: {exc}"}
+            result["price_refresh"] = pricing
+            # The question the endpoint answers is the one that decides whether this
+            # attempt worked: "the refresh ran" is not the same claim as "today's data
+            # is now available", and only the second one is worth retrying for.
+            result["ok"] = bool(result["ok"] and pricing.get("available"))
+            # `detail` is the only field the scheduler logs and /schedule shows
+            # (schedule.py:192), so it says what happened rather than "no detail".
+            result["detail"] = (
+                f"daily {result['status']}; priced {pricing.get('priced', 0)}/"
+                f"{pricing.get('universe', 0)} of the {market} universe; "
+                f"available {'true' if pricing.get('available') else 'false'}")
         return result
 
     return RefreshScheduler(

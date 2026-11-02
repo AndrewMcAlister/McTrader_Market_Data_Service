@@ -36,7 +36,9 @@ from typing import Any, Dict, Iterable, List, Optional
 
 log = logging.getLogger(__name__)
 
-#: Internal purpose -> the ``RequestTypes.RequestType`` that prices it.
+#: Internal purpose -> the ``RequestTypes.RequestType`` that prices it. A purpose whose row
+#: depends on what was asked (``eod_bulk``, which names the market) is overridden at the call
+#: site; the entry here is the default for a caller that names no market.
 PURPOSE_REQUEST_TYPE: Dict[str, str] = {
     "real_time": "/real-time/",
     "real_time_bulk": "/real-time?ex=US",

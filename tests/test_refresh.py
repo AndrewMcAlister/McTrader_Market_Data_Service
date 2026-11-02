@@ -67,6 +67,24 @@ def test_each_market_has_its_own_freshness_row():
     assert refresh.is_fresh(FakeStore(pulls=1), "AU") is True
 
 
+def test_an_au_pull_does_not_make_the_us_fresh():
+    """One ledger row per market; reading another market's row hides an uncollected session."""
+
+    class RecordingStore:
+        def __init__(self) -> None:
+            self.asked = []
+
+        def bulk_pull_count(self, request_type, usage_date=None) -> int:
+            self.asked.append(request_type)
+            return 1 if request_type == "/eod-bulk-last-day/AU" else 0
+
+    store = RecordingStore()
+
+    assert refresh.is_fresh(store, "AU") is True
+    assert refresh.is_fresh(store, "US") is False
+    assert store.asked == ["/eod-bulk-last-day/AU", "/eod-bulk-last-day/US"]
+
+
 # ---------------------------------------------------------------------------
 # the outcomes
 # ---------------------------------------------------------------------------

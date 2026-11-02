@@ -27,6 +27,7 @@ ROWS = [
     {"request_type": "/eod/", "cost_basis": "per_call", "cost_each": 1},
     {"request_type": "/intraday/", "cost_basis": "per_call", "cost_each": 5},
     {"request_type": "/eod-bulk-last-day/US", "cost_basis": "flat", "cost_each": 100},
+    {"request_type": "/eod-bulk-last-day/AU", "cost_basis": "flat", "cost_each": 100},
     {"request_type": "/screener", "cost_basis": "flat", "cost_each": 5},
     {"request_type": "/user", "cost_basis": "free", "cost_each": 0},
     {"request_type": "unknown", "cost_basis": "per_call", "cost_each": None},
@@ -55,6 +56,12 @@ def test_per_symbol_treats_zero_symbols_as_one(tariff):
 def test_flat_ignores_the_batch(tariff):
     assert tariff.price("/real-time?ex=US", 0) == 100
     assert tariff.price("/real-time?ex=US", 5000) == 100
+
+
+def test_each_market_has_its_own_flat_bulk_price(tariff):
+    """The AU row exists so the ledger names the market pulled; it is priced the same."""
+    assert tariff.price("/eod-bulk-last-day/AU", 0) == 100
+    assert tariff.price("/eod-bulk-last-day/AU", 5000) == 100
 
 
 def test_per_call_ignores_the_batch(tariff):

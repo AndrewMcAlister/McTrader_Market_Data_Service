@@ -37,6 +37,12 @@ DEFAULT_PRICE_TTL_SECONDS = 300.0
 #: hundred times more expensive.
 DEFAULT_BULK_BREAKEVEN = 100
 
+#: How many symbols the schedule prices one-by-one for a venue with no whole-market
+#: real-time feed -- the ASX today. One vendor unit each, so 100 is the same order as the
+#: US snapshot's flat 100, and enough to give the books a universe they can rank while
+#: making "today's data is available" true shortly after the collection runs.
+DEFAULT_SCHEDULE_PRICE_UNIVERSE = 100
+
 #: ATR needs 14 completed sessions plus one earlier close to give the first bar a
 #: previous close. Fifteen is the floor; a request for fewer cannot produce ATR(14).
 DEFAULT_MIN_SESSIONS = 15
@@ -94,6 +100,7 @@ class Settings:
     # -- behaviour ---------------------------------------------------------
     price_ttl_seconds: float = DEFAULT_PRICE_TTL_SECONDS
     bulk_breakeven: int = DEFAULT_BULK_BREAKEVEN
+    schedule_price_universe: int = DEFAULT_SCHEDULE_PRICE_UNIVERSE
     min_sessions: int = DEFAULT_MIN_SESSIONS
     atr_periods: tuple = DEFAULT_ATR_PERIODS
     atr_period: int = DEFAULT_ATR_PERIOD
@@ -202,6 +209,8 @@ def load(api_key: Optional[str] = None) -> Settings:
         db_timeout_seconds=_env_int("MDS_DB_TIMEOUT", 30),
         price_ttl_seconds=_env_float("MDS_PRICE_TTL_SECONDS", DEFAULT_PRICE_TTL_SECONDS),
         bulk_breakeven=_env_int("MDS_BULK_BREAKEVEN", DEFAULT_BULK_BREAKEVEN),
+        schedule_price_universe=_env_int("MDS_SCHEDULE_PRICE_UNIVERSE",
+                                         DEFAULT_SCHEDULE_PRICE_UNIVERSE),
         min_sessions=_env_int("MDS_MIN_SESSIONS", DEFAULT_MIN_SESSIONS),
         atr_periods=tuple(periods) if periods else DEFAULT_ATR_PERIODS,
         atr_period=_env_int("MDS_ATR_PERIOD", DEFAULT_ATR_PERIOD),
