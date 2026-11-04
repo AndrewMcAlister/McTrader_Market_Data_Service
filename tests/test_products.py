@@ -610,3 +610,53 @@ def test_the_response_always_states_the_definition_it_used():
     assert result["method"] == "high_low"
     assert result["smoothing"] == "simple"
 
+
+# ---------------------------------------------------------------------------
+# the market: venue, country_code, or the symbol's own suffix
+#
+# The same ticker trades on more than one exchange, so every product has to be told
+# (or shown) which one -- and the market it used has to be the market the rows are
+# cached under, or the ASX CBA overwrites the US one.
+# ---------------------------------------------------------------------------
+
+def test_a_country_code_picks_the_market_the_price_is_cached_under():
+    products, _, store = _products()
+    result = products.prices(["CBA"], country_code="AU")
+    assert result["venue"] == "AU"
+    assert ("CBA", "AU") in store.prices
+    assert ("CBA", "US") not in store.prices
+    assert result["quotes"]["CBA"]["venue"] == "AU"
+
+
+def test_a_suffixed_symbol_states_its_own_market_when_no_venue_does():
+    """``CBA.AU`` used to be stripped and priced at venue US: the suffix was decoration."""
+    products, _, store = _products()
+    products.prices(["CBA.AU"])
+    assert ("CBA", "AU") in store.prices
+    assert ("CBA", "US") not in store.prices
+
+
+def test_a_stated_market_and_a_contradicting_suffix_are_refused_before_any_spend():
+    products, client, _ = _products()
+    with pytest.raises(MarketDataError) as exc:
+        products.prices(["CBA.AU"], venue="US")
+    assert exc.value.reason == "venue-conflict"
+    assert exc.value.status == 400
+    assert client.calls["real_time"] == 0
+
+
+def test_bars_honour_a_country_code_and_file_the_rows_under_it():
+    products, _, store = _products()
+    payload = products.bars(["CBA"], sessions=15, country_code="AU")
+    assert payload["bars"]["CBA"]["venue"] == "AU"
+    assert {row["exchange"] for row in store.daily["CBA"].values()} == {"AU"}
+
+
+def test_atr_at_a_country_code_is_cached_under_that_market():
+    products, _, store = _products()
+    result = products.atr_batch(["CBA"], country_code="AU")
+    assert result["venue"] == "AU"
+    assert result["atr"]["CBA"]["value"] is not None
+    # The write carries the market: without it the next AU request reads a US ATR.
+    assert store.indicators["CBA"]["exchange"] == "AU"
+

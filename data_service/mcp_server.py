@@ -87,19 +87,26 @@ async def _request(method: str, path: str, **kwargs: Any) -> Dict[str, Any]:
 
 @mcp.tool(description=(
     "Latest price for ONE symbol, cached for five minutes, with the previous close and the "
-    "percentage move between them. `venue` is a venue/country code (US, AU, L, TO, HK, F, PA). "
-    "`asset_class` picks the provider: shares (default) and indices/commodities/rates/forex go "
-    "to EODHD then Yahoo; crypto goes to Binance first. The answer names the provider that "
-    "served it and both ages -- `age_seconds` (our cache) and `as_of_age_seconds` (the vendor's "
+    "percentage move between them. `country_code` (US, AU) and `venue` (US, AU/ASX, L, TO, "
+    "HK, F, PA) are two spellings of the same fact -- which market the ticker is in -- and "
+    "`CBA` is both an ASX and a US listing, so state one. `asset_class` picks the provider: "
+    "shares (default) and indices/commodities/rates/forex go to EODHD then Yahoo; crypto goes "
+    "to Binance first. The answer names the provider that served it, the market it belongs "
+    "to and both ages -- `age_seconds` (our cache) and `as_of_age_seconds` (the vendor's "
     "observation, which can be older). bid/ask are always null: this vendor has no quote side."
 ))
 async def get_price(
     symbol: str,
-    venue: str = "US",
+    venue: Optional[str] = None,
+    country_code: Optional[str] = None,
     asset_class: Optional[str] = None,
     max_age_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
-    params: Dict[str, Any] = {"venue": venue}
+    params: Dict[str, Any] = {}
+    if venue:
+        params["venue"] = venue
+    if country_code:
+        params["country_code"] = country_code
     if asset_class:
         params["asset_class"] = asset_class
     if max_age_seconds is not None:
@@ -108,20 +115,27 @@ async def get_price(
 
 
 @mcp.tool(description=(
-    "Latest prices for a LIST of symbols in one call, cached for five minutes. The service "
-    "picks the cheaper route itself from the list length, because the tariff breaks even at 100 "
-    "symbols (1 unit per symbol against 100 flat for the whole market) -- so a 6-symbol request "
-    "and a 2,800-symbol request are both priced correctly without the caller knowing about it. "
-    "`route` in the answer says which way it went. Symbols the vendor cannot price come back "
-    "under `missing`, not as zeros."
+    "Latest prices for a LIST of symbols in one call, cached for five minutes. `country_code` "
+    "or `venue` names the market, because a ticker is not unique across them (`CBA` is an ASX "
+    "listing and a US one); one request is one market, and the answer echoes `venue`. The "
+    "service picks the cheaper route itself from the list length, because the tariff breaks "
+    "even at 100 symbols (1 unit per symbol against 100 flat for the whole market) -- so a "
+    "6-symbol request and a 2,800-symbol request are both priced correctly without the caller "
+    "knowing about it. `route` in the answer says which way it went. Symbols the vendor "
+    "cannot price come back under `missing`, not as zeros."
 ))
 async def get_prices(
     symbols: List[str],
-    venue: str = "US",
+    venue: Optional[str] = None,
+    country_code: Optional[str] = None,
     asset_class: Optional[str] = None,
     max_age_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
-    body: Dict[str, Any] = {"symbols": symbols, "venue": venue}
+    body: Dict[str, Any] = {"symbols": symbols}
+    if venue:
+        body["venue"] = venue
+    if country_code:
+        body["country_code"] = country_code
     if asset_class:
         body["asset_class"] = asset_class
     if max_age_seconds is not None:
@@ -131,7 +145,11 @@ async def get_prices(
 
 @mcp.tool(description=(
     "Average True Range for one or more symbols, from the precomputed IndicatorCache, so it "
-    "costs no vendor call when it has been calculated for the session. TRUE RANGE IS "
+    "costs no vendor call when it has been calculated for the session. `country_code` (US, AU) "
+    "or `venue` (US, AU/ASX, L, TO, HK, F, PA) names the market -- the cache is keyed by it, so "
+    "an ASX `CBA` and a US `CBA` have separate ATRs and neither is served for the other; with "
+    "neither stated, a suffixed symbol such as `CBA.AU` decides and bare symbols default to US. "
+    "TRUE RANGE IS "
     "GAP-INCLUSIVE: max(High-Low, |High-PrevClose|, |Low-PrevClose|), averaged over the last N "
     "bars -- the standard method, and what every existing implementation in the estate uses. "
     "`method` may be 'tr' (default) or 'high_low', and `smoothing` 'simple' (default, the N-bar "
@@ -144,14 +162,18 @@ async def get_atr(
     period: int = 14,
     method: Optional[str] = None,
     smoothing: Optional[str] = None,
-    venue: str = "US",
+    venue: Optional[str] = None,
+    country_code: Optional[str] = None,
     asset_class: Optional[str] = None,
     price: Optional[float] = None,
     multiplier: Optional[float] = None,
     direction: str = "long",
 ) -> Dict[str, Any]:
-    body: Dict[str, Any] = {"symbols": symbols, "period": period, "venue": venue,
-                            "direction": direction}
+    body: Dict[str, Any] = {"symbols": symbols, "period": period, "direction": direction}
+    if venue:
+        body["venue"] = venue
+    if country_code:
+        body["country_code"] = country_code
     if method:
         body["method"] = method
     if smoothing:
@@ -167,20 +189,30 @@ async def get_atr(
 
 @mcp.tool(description=(
     "Completed daily bars for one or more symbols, from DailySnapshot, with the vendor called "
-    "only when the cache is short. The session still in progress is always excluded: a partial "
-    "session has a partial range and using it shrinks a stop exactly when the morning is quiet. "
-    "Each answer carries `as_of_session`, `adjusted` (whether the series is split-adjusted) and "
-    "`provider`. `allow_fetch=false` answers only from the cache and never calls a vendor."
+    "only when the cache is short. `country_code` (US, AU) or `venue` (US, AU/ASX, L, TO, HK, F, "
+    "PA) names the market, and it chooses the series: `CBA` at the ASX and `CBA` in New York are "
+    "different instruments, so a venue with a short series answers `short_history` rather than "
+    "borrowing the other one's bars. With neither stated, a suffixed symbol such as `CBA.AU` "
+    "decides and bare symbols default to US. The session still in progress is always excluded: "
+    "a partial session has a partial range and using it shrinks a stop exactly when the morning "
+    "is quiet. Each answer carries `as_of_session`, `venue`, `adjusted` (whether the series is "
+    "split-adjusted) and `provider`. `allow_fetch=false` answers only from the cache and never "
+    "calls a vendor."
 ))
 async def get_bars(
     symbols: List[str],
     sessions: int = 15,
-    venue: str = "US",
+    venue: Optional[str] = None,
+    country_code: Optional[str] = None,
     asset_class: Optional[str] = None,
     allow_fetch: bool = True,
 ) -> Dict[str, Any]:
-    body: Dict[str, Any] = {"symbols": symbols, "sessions": sessions, "venue": venue,
+    body: Dict[str, Any] = {"symbols": symbols, "sessions": sessions,
                             "allow_fetch": allow_fetch}
+    if venue:
+        body["venue"] = venue
+    if country_code:
+        body["country_code"] = country_code
     if asset_class:
         body["asset_class"] = asset_class
     return await _request("POST", "/bars", json=body)

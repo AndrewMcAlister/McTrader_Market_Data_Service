@@ -42,10 +42,18 @@ what to delete in McTrader.
 
 ## The four endpoints
 
+Every endpoint that takes a symbol also takes the market, because a ticker is not unique across
+exchanges (`CBA` is an ASX listing *and* a US one). Say it with `country_code` (`US`, `AU`), with
+`venue` (`US`, `AU`/`ASX`, `L`/`LSE`, `TO`, `HK`, `F`, `PA`) or in the symbol itself (`CBA.AU`).
+A stated country/venue wins, then the suffix, then `US`; a contradiction is a 400
+(`venue-conflict`), because serving either market silently is how two venues' prices get mixed.
+Every answer states the market it used.
+
 ### `GET /price/{symbol}`
 
 ```
-GET /price/AAPL?venue=US
+GET /price/AAPL?country_code=US
+GET /price/CBA?country_code=AU        # or /price/CBA.AU
 ```
 ```json
 {
@@ -66,7 +74,7 @@ quote side.
 ### `POST /prices`
 
 ```json
-{ "symbols": ["AAPL", "MSFT"], "venue": "US", "max_age_seconds": 300 }
+{ "symbols": ["AAPL", "MSFT"], "country_code": "US", "max_age_seconds": 300 }
 ```
 ```json
 {
@@ -122,12 +130,13 @@ definition cannot be reproduced.
 
 **The ATR is one venue's ATR.** `IndicatorCache` is keyed by `(symbol, exchange)`, so an ASX
 `CBA` is never served the US `CBA`'s volatility — which, with a symbol-only key, is exactly
-what would have happened.
+what would have happened. `country_code` (or `venue`, or a `CBA.AU` suffix) is what picks the
+series, and `venue` is echoed at the top of the response.
 
 ### `POST /bars`
 
 ```json
-{ "symbols": ["AAPL"], "sessions": 15, "venue": "US", "allow_fetch": true }
+{ "symbols": ["AAPL"], "sessions": 15, "country_code": "US", "allow_fetch": true }
 ```
 ```json
 {
@@ -142,10 +151,10 @@ what would have happened.
 }
 ```
 
-`venue` selects which series is read, because `DailySnapshot` is keyed by exchange: `AAPL` at
-`venue=AU` is a different instrument from `AAPL` at `venue=US`, not a misspelling to fall back
-from. A venue whose series is short answers `short_history`; it does not borrow the other
-venue's bars.
+`country_code`/`venue` selects which series is read, because `DailySnapshot` is keyed by
+exchange: `AAPL` at `AU` is a different instrument from `AAPL` at `US`, not a misspelling to
+fall back from. A venue whose series is short answers `short_history`; it does not borrow the
+other venue's bars. A suffixed symbol (`CBA.AU`) states the same thing when no country is sent.
 
 The session in progress is **dropped here**, in the service, not by each caller — a partial
 session has a partial range and using it shrinks a stop exactly when the morning is quiet.
@@ -282,14 +291,31 @@ Smoothing is the same story: `simple` is what both stop books use (so it is the 
 
 ## Data model
 
-Three tables, created by `sql/001_schema.sql`, in the database `MDS_DATABASE` points at
-(`Back_Test` today). The script names no database, so the rename is config, not migration.
+Three tables the service owns, created by `sql/001_schema.sql`, in the database
+`MDS_DATABASE` points at (`Market_Data` today), plus the clock's exchange reference.
+The script names no database, so a rename is config, not migration.
 
 | Table | Grain | Holds |
 |---|---|---|
 | `SymbolPriceCache` | symbol × venue | latest known price, overwritten in place |
 | `DailySnapshot` | symbol × exchange × session | daily OHLCV, appended once per session per venue |
 | `IndicatorCache` | symbol × exchange | precomputed ATR 14/20/22/26/50 for one venue's series |
+| `Exchanges` | one row per exchange | `Code`, `Timezone`, `Opens`, `Closes` in the exchange's own local time; copied from `McTrader_Live.dbo.Exchanges` by `tools/copy_exchanges.py` and read by the market clock |
+
+The market clock reads the exchange hours from `dbo.Exchanges`, not from
+`data/clock.json`. The JSON keeps the broker table, the asset-class rules and the
+broker-to-exchange mapping, and is the fallback if the database cannot be read —
+so a database outage freezes the clock at the last copied exchange list rather
+than taking it down. Refresh the copy deliberately:
+
+```
+.venv\Scripts\python.exe tools\copy_exchanges.py
+```
+
+The clock loads the table once at startup. Reload after a refresh with
+`POST /admin/shutdown` (NSSM restarts the process within ~5s), or restart the
+service. The clock's `reference_source` names the database table when this is the
+source in use, and `data/clock.json` when it has fallen back.
 
 Notes that are load-bearing:
 

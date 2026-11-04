@@ -38,13 +38,14 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from . import atr as atr_module
 from . import config as config_module
-from .eodhd import EodhdClient, EodhdError, bare_symbol, normalise_venue
+from .eodhd import EodhdClient, EodhdError, bare_symbol
 from .providers import (
     ProviderError, build_router, normalise_asset_class,
 )
-from .sessions import latest_completed_session, market_code
+from .sessions import latest_completed_session
 from .store import Store
 from .usage import Tariff, UsageLedger
+from .venues import resolve_venue
 
 log = logging.getLogger(__name__)
 
@@ -106,6 +107,22 @@ def _number(value: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return out if out == out and abs(out) != float("inf") else None
+
+
+def _wanted_symbols(symbols: Sequence[str], kind: str) -> List[str]:
+    """The request's symbols, bare and de-duplicated, in the order they arrived.
+
+    A suffix is stripped because the venue is served separately -- and the venue has already
+    been read off that suffix by ``resolve_venue``, so dropping it here loses nothing. Crypto
+    keeps its pair as sent: ``BTC-USD`` has no venue suffix to strip and ``BTC`` alone is a
+    different (and usually unpriced) request.
+    """
+    wanted: List[str] = []
+    for raw in symbols:
+        text = str(raw).strip().upper() if kind == "crypto" else bare_symbol(str(raw))
+        if text and text not in wanted:
+            wanted.append(text)
+    return wanted
 
 
 class Products:
@@ -232,6 +249,9 @@ class Products:
             as_of_age = (_utc_naive() - as_of).total_seconds()
         return {
             "symbol": stored.get("symbol"),
+            # Which market this price is for. ``CBA`` at AU and at US are two instruments,
+            # and a caller that sent only a country code needs to see which one answered.
+            "venue": stored.get("venue"),
             "price": stored.get("price"),
             "previous_close": stored.get("previous_close"),
             "change_pct": stored.get("change_pct"),
@@ -244,40 +264,43 @@ class Products:
             "as_of_age_seconds": round(as_of_age, 3) if as_of_age is not None else None,
         }
 
-    def price(self, symbol: str, venue: str = "US",
+    def price(self, symbol: str, venue: Optional[str] = None,
               max_age_seconds: Optional[float] = None,
-              asset_class: Optional[str] = None) -> Dict[str, Any]:
+              asset_class: Optional[str] = None,
+              country_code: Optional[str] = None) -> Dict[str, Any]:
         """One symbol's latest price: cache first, then one vendor call."""
         batch = self.prices([symbol], venue=venue, max_age_seconds=max_age_seconds,
-                            asset_class=asset_class)
+                            asset_class=asset_class, country_code=country_code)
         kind = normalise_asset_class(asset_class)
         key = bare_symbol(symbol) if kind != "crypto" else str(symbol).strip().upper()
         quotes = batch.get("quotes") or {}
         if key not in quotes:
             raise MarketDataError(
                 "unpriced",
-                f"{symbol!r} could not be priced at venue {venue!r}",
+                f"{symbol!r} could not be priced at market {batch.get('venue')!r}",
                 status=404)
         return quotes[key]
 
-    def prices(self, symbols: Sequence[str], venue: str = "US",
+    def prices(self, symbols: Sequence[str], venue: Optional[str] = None,
                max_age_seconds: Optional[float] = None,
-               asset_class: Optional[str] = None) -> Dict[str, Any]:
+               asset_class: Optional[str] = None,
+               country_code: Optional[str] = None) -> Dict[str, Any]:
         """Latest prices for a batch, choosing bulk or per-symbol by size.
 
         The break-even is the measured tariff: 100 units flat for the whole market against
         1 per symbol, so above ``bulk_breakeven`` symbols the bulk call is cheaper and below
         it the bulk call is up to a hundred times more expensive.
+
+        ``venue`` or ``country_code`` names the market, because ``CBA`` at the ASX and ``CBA``
+        in New York are two instruments; with neither, a symbol's own ``.AU`` suffix decides
+        and bare symbols default to US. See :mod:`data_service.venues`.
         """
-        # Crypto and FX have no venue suffix discipline, so the venue is not normalised for
-        # them: a crypto pair has no .US, and requiring one would refuse every crypto request.
         kind = normalise_asset_class(asset_class)
-        market = "CRYPTO" if kind == "crypto" else normalise_venue(venue)
-        wanted: List[str] = []
-        for raw in symbols:
-            text = bare_symbol(str(raw)) if kind != "crypto" else str(raw).strip().upper()
-            if text and text not in wanted:
-                wanted.append(text)
+        # One market for the whole batch: the cache, the vendor ticker and the rows written
+        # back are all keyed by it, so a list spanning two venues is refused rather than
+        # half-served (venues.resolve_venue).
+        market = resolve_venue(venue, country_code, symbols, kind)
+        wanted = _wanted_symbols(symbols, kind)
         if not wanted:
             raise MarketDataError("no-symbols", "supply at least one symbol")
 
@@ -332,6 +355,10 @@ class Products:
 
         return {
             "quotes": quotes,
+            # The market this batch was priced on. Echoed because it may have been derived
+            # from a symbol suffix rather than stated, and a caller must be able to see which
+            # instrument a quote belongs to.
+            "venue": market,
             "fetched": fetched,
             "missing": missing,
             "deferred": [],
@@ -422,9 +449,10 @@ class Products:
     # bars
     # ------------------------------------------------------------------
 
-    def bars(self, symbols: Sequence[str], sessions: int = 15, venue: str = "US",
+    def bars(self, symbols: Sequence[str], sessions: int = 15, venue: Optional[str] = None,
              allow_fetch: bool = True,
-             asset_class: Optional[str] = None) -> Dict[str, Any]:
+             asset_class: Optional[str] = None,
+             country_code: Optional[str] = None) -> Dict[str, Any]:
         """Completed daily bars. Cache (DailySnapshot) first, then one /eod/ call each.
 
         ``sessions`` is floored at ``min_sessions`` for ATR purposes elsewhere, but this
@@ -450,14 +478,14 @@ class Products:
         is refreshed for a handful of sessions and costs the same. That is what makes the
         history accumulate as symbols are requested, instead of every symbol being pinned
         at the fifteen sessions the window used to keep.
+
+        ``venue``/``country_code`` chooses the series, and so does a suffixed symbol when
+        neither is stated: ``CBA.AU`` is ASX data, not a US listing that happens to share the
+        ticker (see :mod:`data_service.venues`).
         """
         kind = normalise_asset_class(asset_class)
-        market = "CRYPTO" if kind == "crypto" else normalise_venue(venue)
-        wanted: List[str] = []
-        for raw in symbols:
-            text = bare_symbol(str(raw)) if kind != "crypto" else str(raw).strip().upper()
-            if text and text not in wanted:
-                wanted.append(text)
+        market = resolve_venue(venue, country_code, symbols, kind)
+        wanted = _wanted_symbols(symbols, kind)
         if not wanted:
             raise MarketDataError("no-symbols", "supply at least one symbol")
         if sessions < 1:
@@ -622,12 +650,13 @@ class Products:
         period: Optional[int] = None,
         method: Optional[str] = None,
         smoothing: Optional[str] = None,
-        venue: str = "US",
+        venue: Optional[str] = None,
         price: Optional[float] = None,
         multiplier: Optional[float] = None,
         direction: str = "long",
         allow_fetch: bool = True,
         asset_class: Optional[str] = None,
+        country_code: Optional[str] = None,
     ) -> Dict[str, Any]:
         """ATR per symbol, from IndicatorCache when it can answer, else computed.
 
@@ -635,6 +664,10 @@ class Products:
         ``Method`` column and one ``Smoothing`` column: a request for a different definition
         is computed on the fly and not cached. That keeps the table honest -- a cached value
         can always be read back with the definition that produced it.
+
+        The market comes from ``venue``, ``country_code`` or the symbols' own suffix (see
+        :mod:`data_service.venues`), and it is the cache key: an ASX ``CBA`` and a US ``CBA``
+        have separate ATRs and neither is served for the other.
         """
         period = int(period or self.settings.atr_period)
         method = (method or self.settings.atr_method).lower()
@@ -668,7 +701,7 @@ class Products:
         # One normalised market for the whole call: the ATR cache is keyed by venue, so the
         # read has to ask with the same code the bars were written under ("ASX" and "AU" are
         # one venue, and AU is what is stored).
-        market = market_code(venue, asset_class)
+        market = resolve_venue(venue, country_code, symbols, asset_class)
         cached = self.store.get_indicators(wanted, market) if cache_eligible else {}
         latest = latest_completed_session(market)
 
@@ -708,8 +741,8 @@ class Products:
             longest = max(list(self.settings.atr_periods) + [period])
             need = max(self.settings.min_sessions, longest + 1)
             bar_payload = self.bars(
-                to_compute, sessions=need, venue=venue, allow_fetch=allow_fetch,
-                asset_class=asset_class)
+                to_compute, sessions=need, venue=market, allow_fetch=allow_fetch,
+                asset_class=asset_class, country_code=country_code)
 
             fresh_for_cache: List[Dict[str, Any]] = []
             for symbol in to_compute:
@@ -808,6 +841,9 @@ class Products:
 
         return {
             "atr": results,
+            # The market the readings belong to: derived from a country code or a symbol
+            # suffix as often as it is stated, so it is stated back.
+            "venue": market,
             "period": period,
             "method": method,
             "smoothing": smoothing,

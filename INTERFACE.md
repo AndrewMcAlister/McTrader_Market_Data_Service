@@ -12,6 +12,42 @@ error codes, and the traps that produce wrong code if ignored.
 
 ---
 
+## Choosing the market — every symbol endpoint takes a country code
+
+A ticker is not unique across markets: `CBA` is an ASX listing **and** a US listing, with two
+prices, two daily series and two ATRs. So every endpoint below that takes a symbol also takes
+the market, in any of three spellings that mean the same thing:
+
+| Spelling | Where | Examples |
+|---|---|---|
+| `country_code` | query (GET) or body (POST) | `US`, `AU` (case-insensitive) |
+| `venue` | query (GET) or body (POST) | `US`, `AU`/`ASX`/`AX`, `L`/`LSE`/`UK`, `TO`/`TSX`, `HK`, `F`/`DE`, `PA` |
+| the symbol's own suffix | inside the symbol | `CBA.AU`, `VOD.L`, `AAPL.US` |
+
+They resolve in this order: **a stated `country_code`/`venue`** → **the symbol's suffix** →
+**`US`**. So all of these are valid and mean the ASX listing:
+
+```json
+{"symbols": ["CBA"], "country_code": "AU"}
+{"symbols": ["CBA"], "venue": "ASX"}
+{"symbols": ["CBA.AU"]}
+```
+
+Two rules follow, and both are refusals rather than guesses — serving either market silently
+is how two venues' prices get mixed:
+
+- stating both spellings with **different** markets is `400 venue-conflict` (`venue: "US"` with
+  `CBA.AU` is the same case);
+- **one request is one market**: a batch whose symbols carry two different suffixes is
+  `400 mixed-venues`. Split it into two calls.
+
+The market that was used comes back on every answer (`venue` on `/prices` and `/atr`,
+per-symbol on `/bars`, and per-quote on `/price`), so a caller never has to assume which
+instrument a number belongs to. Crypto has no market: `asset_class: "crypto"` is cached under
+`CRYPTO` and `country_code`/`venue` is ignored.
+
+---
+
 ## 1. `GET /price/{symbol}`
 
 Latest price for one symbol.
@@ -20,15 +56,20 @@ Latest price for one symbol.
 
 | Name | Type | Default | Notes |
 |---|---|---|---|
-| `venue` | string | `US` | Venue/country code. `US`, `AU`/`ASX`, `L`/`LSE`, `TO`, `HK`, `F`, `PA`. Ignored for crypto. |
+| `country_code` | string | `US` | Country code: `US`, `AU`. The market the ticker is in — `CBA` is both an ASX and a US listing |
+| `venue` | string | `US` | The same fact as `country_code`, in venue spelling: `US`, `AU`/`ASX`, `L`/`LSE`, `TO`, `HK`, `F`, `PA`. Ignored for crypto |
 | `asset_class` | string | `shares` | `shares`, `crypto`, `indices`, `commodities`, `rates`, `forex`. Chooses the provider. |
 | `max_age_seconds` | float | `300` | **Lowers** the cache window; cannot raise it. |
+
+Send either `country_code` or `venue`, or neither (then a suffixed symbol such as `CBA.AU`
+decides and a bare one is US). Sending both with different markets is `400 venue-conflict`.
 
 **200 response**
 
 ```json
 {
   "symbol": "AAPL",
+  "venue": "US",
   "price": 343.83,
   "previous_close": 347.10,
   "change_pct": -0.9421,
@@ -46,6 +87,7 @@ Latest price for one symbol.
 
 | Status | Body `error` | Meaning |
 |---|---|---|
+| 400 | `unknown-venue`, `venue-conflict` | the market could not be resolved — see §Choosing the market |
 | 404 | `unpriced` | nothing could price it |
 | 502 | vendor reason | the vendor refused |
 | 503 | `vendor-unavailable` | the service has no vendor client configured |
@@ -65,19 +107,23 @@ separate endpoint.
 **Request**
 
 ```json
-{ "symbols": ["AAPL", "MSFT"], "venue": "US", "asset_class": null, "max_age_seconds": 300 }
+{ "symbols": ["AAPL", "MSFT"], "country_code": "US", "asset_class": null, "max_age_seconds": 300 }
 ```
+
+`country_code` and `venue` are interchangeable (§Choosing the market); `venue` is what the
+older examples show. The market used is echoed as `venue` in the response.
 
 **200 response**
 
 ```json
 {
   "quotes": {
-    "AAPL": { "symbol": "AAPL", "price": 343.83, "previous_close": 347.10, "change_pct": -0.9421,
+    "AAPL": { "symbol": "AAPL", "venue": "US", "price": 343.83, "previous_close": 347.10, "change_pct": -0.9421,
               "bid": null, "ask": null, "provider": "eodhd",
               "fetched_at": "2026-10-29T04:34:16", "age_seconds": 0.4,
               "as_of": "2026-10-28T20:29:00", "as_of_age_seconds": 25424.3 }
   },
+  "venue": "US",
   "fetched": ["AAPL"],
   "missing": [],
   "deferred": [],
@@ -99,7 +145,8 @@ separate endpoint.
 the whole US market. Below 100 symbols per-symbol is cheaper; at 100 or more, bulk wins by up to 100×.
 Send the list you need and let the service decide.
 
-**Errors:** 400 `no-symbols`, 502 vendor, 503 `database-busy`.
+**Errors:** 400 `no-symbols`, `unknown-venue`, `venue-conflict`, `mixed-venues`; 502 vendor;
+503 `database-busy`.
 
 ---
 
@@ -116,7 +163,7 @@ else computed from daily bars.
   "period": 14,
   "method": "tr",
   "smoothing": "simple",
-  "venue": "US",
+  "country_code": "US",
   "asset_class": null,
   "price": 343.83,
   "multiplier": 1.0,
@@ -126,6 +173,7 @@ else computed from daily bars.
 
 | Field | Default | Notes |
 |---|---|---|
+| `country_code` / `venue` | `US` | the market the series is measured on — see §Choosing the market |
 | `period` | `14` | |
 | `method` | `tr` | `tr` = gap-inclusive true range (the standard); `high_low` = High−Low only |
 | `smoothing` | `simple` | `simple` = mean of the last N ranges (the standard); `wilder` |
@@ -146,6 +194,7 @@ else computed from daily bars.
       "stop_level": 337.64715
     }
   },
+  "venue": "US",
   "period": 14, "method": "tr", "smoothing": "simple", "complete": true
 }
 ```
@@ -159,9 +208,9 @@ else computed from daily bars.
 | `reason` | why `value` is `null` |
 | `stop_level` | present only when `price` and `multiplier` were both supplied |
 
-`venue` chooses the series the ATR is measured on: `IndicatorCache` is keyed by
+`venue`/`country_code` chooses the series the ATR is measured on: `IndicatorCache` is keyed by
 `(symbol, exchange)`, so an ASX `CBA` and a US `CBA` have separate ATRs and neither is served
-for the other.
+for the other. The market used is echoed as `venue` at the top of the response.
 
 **The ATR definition, exactly:**
 
@@ -171,7 +220,7 @@ ATR(n)  = sum(TR for the last n bars) / n
 ```
 
 **Errors:** 400 `bad-method`, `bad-smoothing`, `bad-period`, `incomplete-stop` (price without
-multiplier), `no-symbols`; 502 vendor.
+multiplier), `no-symbols`, `unknown-venue`, `venue-conflict`, `mixed-venues`; 502 vendor.
 
 ---
 
@@ -182,7 +231,7 @@ Completed daily bars.
 **Request**
 
 ```json
-{ "symbols": ["AAPL"], "sessions": 15, "venue": "US", "asset_class": null, "allow_fetch": true }
+{ "symbols": ["AAPL"], "sessions": 15, "country_code": "US", "asset_class": null, "allow_fetch": true }
 ```
 
 **200 response**
@@ -226,15 +275,16 @@ and stores all of it. The same one unit buys it, so `sessions` only controls wha
 not what is kept. A later request for more sessions is then answered from the database instead
 of the vendor — which is what makes support and resistance levels computable.
 
-`venue` chooses the series: the cache is keyed by `(symbol, exchange)`, so `AAPL` at
-`venue=AU` is a different instrument from `AAPL` at `venue=US`. A venue with a short series
-answers `short_history` rather than borrowing the other venue's bars.
+`venue`/`country_code` chooses the series: the cache is keyed by `(symbol, exchange)`, so `AAPL`
+at `AU` is a different instrument from `AAPL` at `US`. A venue with a short series answers
+`short_history` rather than borrowing the other venue's bars.
 
 `allow_fetch: false` answers only from the database and never calls a vendor.
 
 **The session in progress is already excluded.** Do not filter it again downstream.
 
-**Errors:** 400 `bad-sessions`, `no-symbols`; 502 vendor.
+**Errors:** 400 `bad-sessions`, `no-symbols`, `unknown-venue`, `venue-conflict`, `mixed-venues`;
+502 vendor.
 
 ---
 
@@ -338,15 +388,18 @@ A provider that cannot serve an asset class is never asked — Binance is never 
 4. **Do not keep your own cache.** Prices live 300 s here, bars are keyed on the completed session,
    ATR is precomputed. A second cache with its own TTL will disagree after any restart.
 5. **`503 database-busy` is retryable.** It means the daily load held a lock; it clears in seconds.
-6. **Symbol format:** bare (`AAPL`) with `venue`, or already-suffixed (`AAPL.US`). Crypto pairs are
-   bare or dashed (`BTC-USD`); `venue` is ignored for crypto.
+6. **Symbol format:** bare (`AAPL`) with `country_code`/`venue`, or already-suffixed (`AAPL.US`).
+   A suffix with no venue statement *is* the market, so `CBA.AU` is ASX data; contradicting it
+   (`venue: "US"`) is `400 venue-conflict` rather than a guess. Crypto pairs are bare or dashed
+   (`BTC-USD`); the market is ignored for crypto.
 7. **Crypto needs `asset_class: "crypto"`**, or it is treated as a share and priced from the wrong feed.
 8. **Whole-market responses are large** (~12,700 rows, ~2 MB). If you only need the top movers, sort
    locally rather than shortening the list — a shorter list can drop below the 100-symbol break-even
    and become *more* expensive.
-9. **A ticker is not unique across venues.** `CBA` is both an ASX listing and a US one, so `venue`
-   is part of the instrument's identity, not a formatting hint: send it, and expect `short_history`
-   rather than another venue's bars when the requested venue has no series.
+9. **A ticker is not unique across venues.** `CBA` is both an ASX listing and a US one, so the market
+   is part of the instrument's identity, not a formatting hint: send it (or suffix the symbol), and
+   expect `short_history` rather than another venue's bars when the requested venue has no series.
+   One request is one market: a batch with two different suffixes is `400 mixed-venues`.
 
 ---
 
@@ -357,15 +410,16 @@ import requests
 
 BASE = "http://127.0.0.1:8003"
 
-def price(symbol, venue="US", asset_class="shares"):
+def price(symbol, country_code="US", asset_class="shares"):
     r = requests.get(f"{BASE}/price/{symbol}",
-                     params={"venue": venue, "asset_class": asset_class}, timeout=30)
+                     params={"country_code": country_code, "asset_class": asset_class},
+                     timeout=30)
     r.raise_for_status()
     return r.json()
 
-def atr_with_stop(symbol, price_value, multiplier=1.0, period=14):
+def atr_with_stop(symbol, price_value, multiplier=1.0, period=14, country_code="US"):
     r = requests.post(f"{BASE}/atr", json={
-        "symbols": [symbol], "period": period,
+        "symbols": [symbol], "period": period, "country_code": country_code,
         "price": price_value, "multiplier": multiplier, "direction": "long",
     }, timeout=60)
     r.raise_for_status()

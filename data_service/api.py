@@ -20,6 +20,11 @@ Design notes that are deliberate rather than incidental:
   ``FALLBACK to Alpaca IEX prices - a different tape`` with nothing flagging it.
 * **A refusal is always a reason, never a zero.** A symbol that cannot be priced appears
   under ``missing``; it is not cached, so the next call retries it.
+* **A symbol is half an identity.** ``CBA`` is an ASX listing *and* a US listing, with two
+  prices, two series and two ATRs, so every endpoint that takes a symbol takes the market
+  with it: ``venue``, ``country_code``, or the symbol's own ``.AU`` suffix. One resolver
+  (``venues.py``) decides, so the four endpoints cannot disagree about which instrument a
+  ticker names -- and the answer states the market it used.
 """
 from __future__ import annotations
 
@@ -57,7 +62,12 @@ class PricesRequest(BaseModel):
 
     symbols: List[str] = Field(..., min_length=1, description="Bare or suffixed symbols")
     venue: Optional[str] = Field(
-        None, description="Venue/country code, e.g. US (default), AU, L, TO")
+        None, description="Venue code, e.g. US (default), AU, L, TO")
+    country_code: Optional[str] = Field(
+        None,
+        description="Country code, e.g. US (default) or AU. The same fact as `venue`: "
+                    "`CBA` is an ASX listing and a US one, so the market has to be stated. "
+                    "Sending both is allowed only while they agree.")
     max_age_seconds: Optional[float] = Field(
         None, description="Lower the 5-minute cache window; cannot raise it")
     asset_class: Optional[str] = Field(
@@ -87,7 +97,11 @@ class AtrRequest(BaseModel):
     smoothing: Optional[str] = Field(
         None, description="'simple' (default, what the stop books use) or 'wilder'")
     venue: Optional[str] = Field(
-        None, description="Venue/exchange code, e.g. US (default), AU, L, TO")
+        None, description="Venue code, e.g. US (default), AU, L, TO")
+    country_code: Optional[str] = Field(
+        None,
+        description="Country code, e.g. US (default) or AU. The same fact as `venue`, and "
+                    "the one to send when the ticker also trades elsewhere.")
     price: Optional[float] = Field(
         None, description="Supply with multiplier to also get a stop_level")
     multiplier: Optional[float] = Field(
@@ -128,7 +142,11 @@ class BarsRequest(BaseModel):
     symbols: List[str] = Field(..., min_length=1)
     sessions: int = Field(15, ge=1, description="Completed sessions to return")
     venue: Optional[str] = Field(
-        None, description="Venue/exchange code, e.g. US (default), AU, L, TO")
+        None, description="Venue code, e.g. US (default), AU, L, TO")
+    country_code: Optional[str] = Field(
+        None,
+        description="Country code, e.g. US (default) or AU. The same fact as `venue`, and "
+                    "the one to send when the ticker also trades elsewhere.")
     allow_fetch: bool = Field(
         True, description="False = answer only from DailySnapshot, never the vendor")
     asset_class: Optional[str] = Field(None, description="shares (default) or crypto, ...")
@@ -936,7 +954,13 @@ def create_app() -> FastAPI:
     def get_price(
         request: Request,
         symbol: str,
-        venue: str = Query("US", description="Venue/country code"),
+        venue: Optional[str] = Query(
+            None, description="Venue code, e.g. US (default), AU, L, TO"),
+        country_code: Optional[str] = Query(
+            None,
+            description="Country code, e.g. US (default) or AU. The same fact as `venue`: "
+                        "`CBA` is an ASX listing and a US one, so the market has to be "
+                        "stated. Sending both is allowed only while they agree."),
         max_age_seconds: Optional[float] = Query(
             None, description="Lower the 5-minute window; cannot raise it"),
         asset_class: Optional[str] = Query(
@@ -948,7 +972,8 @@ def create_app() -> FastAPI:
             return JSONResponse(status_code=503,
                                 content={"error": "vendor-unavailable"})
         try:
-            return products.price(symbol, venue=venue, max_age_seconds=max_age_seconds,
+            return products.price(symbol, venue=venue, country_code=country_code,
+                                  max_age_seconds=max_age_seconds,
                                   asset_class=asset_class)
         except MarketDataError as exc:
             return _error(exc)
@@ -965,7 +990,7 @@ def create_app() -> FastAPI:
                                 content={"error": "vendor-unavailable"})
         try:
             return products.prices(
-                body.symbols, venue=body.venue or "US",
+                body.symbols, venue=body.venue, country_code=body.country_code,
                 max_age_seconds=body.max_age_seconds,
                 asset_class=body.asset_class)
         except MarketDataError as exc:
@@ -987,7 +1012,8 @@ def create_app() -> FastAPI:
                 period=body.period,
                 method=body.method,
                 smoothing=body.smoothing,
-                venue=body.venue or "US",
+                venue=body.venue,
+                country_code=body.country_code,
                 price=body.price,
                 multiplier=body.multiplier,
                 direction=body.direction or "long",
@@ -1008,7 +1034,8 @@ def create_app() -> FastAPI:
                                 content={"error": "vendor-unavailable"})
         try:
             return products.bars(
-                body.symbols, sessions=body.sessions, venue=body.venue or "US",
+                body.symbols, sessions=body.sessions, venue=body.venue,
+                country_code=body.country_code,
                 allow_fetch=body.allow_fetch, asset_class=body.asset_class)
         except MarketDataError as exc:
             return _error(exc)

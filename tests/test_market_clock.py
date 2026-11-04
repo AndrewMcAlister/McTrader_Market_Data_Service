@@ -15,10 +15,28 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from data_service.clock import MarketClock, resolve_time_zone  # noqa: E402
+import pytest
+
+from data_service.clock import REFERENCE_PATH, MarketClock, resolve_time_zone  # noqa: E402
 
 UTC = timezone.utc
-clock = MarketClock()
+# A fixture path, not the default constructor: these tests must not change their
+# answers because Market_Data happens to be reachable from the test machine.
+clock = MarketClock(path=REFERENCE_PATH)
+
+
+def test_the_exchange_table_comes_from_market_data() -> None:
+    """The primary source is Market_Data.dbo.Exchanges; clock.json is the fallback."""
+    db_clock = MarketClock()
+    if not db_clock.source.startswith("Market_Data.dbo.Exchanges"):
+        pytest.skip("Market_Data.dbo.Exchanges is not available; clock.json fallback in use")
+    rows = sorted(db_clock.exchanges.values(), key=lambda row: row["id"])
+    assert len(rows) == 13
+    nyse = next(row for row in rows if row["code"] == "NYSE")
+    assert (nyse["opens"], nyse["closes"], nyse["timezone"]) == ("09:30", "16:00", "EST")
+    asx = next(row for row in rows if row["code"] == "ASX")
+    assert (asx["opens"], asx["closes"], asx["timezone"]) == ("10:00", "16:00", "AEST")
+
 
 
 def exchange(code: str) -> dict:

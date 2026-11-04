@@ -20,14 +20,21 @@ books cannot disagree about whether a market is open:
 
 WHAT IS INDEPENDENT, AND WHAT IS NOT
 
-This is a *copy*, not a client of McTrader's tables. The reference data (brokers,
-exchanges, the two mapping tables) is frozen in ``data/clock.json``, copied once from
-``McTrader_Live`` on 2026-11-01, and the service reads only that. McTrader can add a
-broker without the service's answers changing underneath it, and the service can be
-restarted on its own schedule. Refreshing the copy is a deliberate act:
+The **exchange** half of the reference is read from ``Market_Data.dbo.Exchanges``, a
+copy of ``McTrader_Live.dbo.Exchanges`` made on 2026-11-04. That is the table the clock
+answers from: ``Timezone``, ``Opens`` and ``Closes`` per exchange, in the exchange's own
+local time. The broker table, the asset-class rules and the broker->exchange mapping
+remain in ``data/clock.json``, which is also the **fallback** when Market_Data is
+unavailable, so the service still starts and answers if the database is down.
 
-    python -m data_service.clock --show          # what the copy holds
-    tools\\copy_clock_reference.py               # re-copy from McTrader_Live
+Refreshing the exchange copy is a deliberate act:
+
+    python tools\\copy_exchanges.py          # McTrader_Live -> Market_Data
+    python -m data_service.clock --show      # what the clock holds now
+
+The clock loads the table once at startup. Reload after a refresh with
+``POST /admin/shutdown`` (the supervisor restarts the process) or restart the
+service.
 
 TIME ZONES
 
@@ -40,6 +47,7 @@ same tables McTrader carries, and the test suite compares this module against it
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from pathlib import Path
@@ -47,6 +55,7 @@ from typing import Any, Dict, Iterable, List, Optional
 from zoneinfo import ZoneInfo
 
 UTC = timezone.utc
+log = logging.getLogger(__name__)
 
 #: Abbreviations that appear in the reference data -> the IANA zone that has DST.
 TZ_ABBREV_TO_IANA: Dict[str, str] = {
@@ -171,15 +180,68 @@ def _skip_weekend(moment: datetime) -> datetime:
     return moment
 
 
+def load_exchanges_from_db() -> Optional[List[Dict[str, Any]]]:
+    """The exchange rows from ``Market_Data.dbo.Exchanges``, or None when unavailable.
+
+    The table is the copy of ``McTrader_Live.dbo.Exchanges`` made on 2026-11-04. It is
+    the clock's primary source; ``data/clock.json`` keeps the broker and asset-class
+    rules and is the fallback, so a database outage degrades to the last frozen copy
+    rather than to no clock at all.
+    """
+    try:
+        import pyodbc
+
+        from .config import load as load_settings
+
+        settings = load_settings()
+        conn = pyodbc.connect(settings.connection_string,
+                              timeout=settings.db_timeout_seconds)
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT Id, Code, Name, Country, Currency, Timezone, Opens, Closes "
+                "FROM dbo.Exchanges ORDER BY Id")
+            rows = [
+                {"id": int(row.Id), "code": row.Code, "name": row.Name,
+                 "country": row.Country,
+                 "currency": (row.Currency or "").strip(),
+                 "timezone": row.Timezone,
+                 "opens": row.Opens, "closes": row.Closes}
+                for row in cursor.fetchall()
+            ]
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 - falling back to the JSON is the point
+        log.warning("market clock: Market_Data.dbo.Exchanges unavailable (%s); "
+                    "falling back to %s", exc, REFERENCE_PATH.name)
+        return None
+    if not rows:
+        log.warning("market clock: Market_Data.dbo.Exchanges is empty; falling back to %s",
+                    REFERENCE_PATH.name)
+        return None
+    return rows
+
+
 class MarketClock:
-    """Resolve sessions from the service's own copy of the reference data."""
+    """Resolve sessions from the database's exchange table and the rule reference."""
 
     def __init__(self, reference: Optional[Dict[str, Any]] = None,
                  path: Optional[Path] = None) -> None:
+        self.source = "unknown"
         if reference is None:
-            source = path or REFERENCE_PATH
-            reference = json.loads(Path(source).read_text(encoding="utf-8"))
-        self.source = reference.get("source", "unknown")
+            source_path = Path(path or REFERENCE_PATH)
+            reference = json.loads(source_path.read_text(encoding="utf-8"))
+            # An explicit path is a fixture (tests, a deliberately frozen copy) and
+            # must not be overridden by whatever is in the database today.
+            db_rows = load_exchanges_from_db() if path is None else None
+            if db_rows:
+                reference = {**reference, "exchanges": db_rows}
+                self.source = (f"Market_Data.dbo.Exchanges ({len(db_rows)} rows) + "
+                               f"{source_path.name} (brokers/rules)")
+            else:
+                self.source = str(reference.get("source") or source_path.name)
+        else:
+            self.source = str(reference.get("source") or "injected")
         self.brokers = {int(b["id"]): b for b in reference.get("brokers", [])}
         self.exchanges = {int(e["id"]): e for e in reference.get("exchanges", [])}
         self.asset_classes = {int(a["id"]): a for a in reference.get("asset_classes", [])}
@@ -292,7 +354,7 @@ class MarketClock:
         NASDAQ, ARCA, AMEX, IEX, all 09:30-16:00 New York; IBKR: ASX and NSX, both
         10:00-16:00 Sydney), and ``exchanges_ambiguous`` says when they are not.
         """
-        ref_utc = ref_utc.astimezone(UTC)
+        ref_utc = (ref_utc or datetime.now(UTC)).astimezone(UTC)
         rule = self.broker_asset_classes.get((broker_id, asset_class_id))
         if rule is None:
             return ResolvedSession(is_open=False, clock_source="unknown",

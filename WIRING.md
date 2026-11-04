@@ -67,10 +67,10 @@ the gap is visible rather than absorbed — but visible is not the same as corre
 
 ## 4. The four endpoints
 
-### `GET /price/{symbol}?venue=US&asset_class=&max_age_seconds=`
+### `GET /price/{symbol}?country_code=US&asset_class=&max_age_seconds=`
 
 ```json
-{ "symbol": "AAPL", "price": 343.83, "previous_close": 347.10, "change_pct": -0.9421,
+{ "symbol": "AAPL", "venue": "US", "price": 343.83, "previous_close": 347.10, "change_pct": -0.9421,
   "bid": null, "ask": null,
   "provider": "eodhd", "fetched_at": "2026-10-29T04:34:16", "age_seconds": 0.4,
   "as_of": "2026-10-28T20:29:00", "as_of_age_seconds": 25424.3 }
@@ -78,13 +78,21 @@ the gap is visible rather than absorbed — but visible is not the same as corre
 
 404 `{"error": "unpriced", ...}` when nothing can price it.
 
+**Send the country.** `country_code` (US, AU) and `venue` (US, AU/ASX, L, TO, HK, F, PA) are two
+spellings of the same fact, and a suffixed symbol (`CBA.AU`) is a third. A ticker is not unique
+across markets — `CBA` is an ASX listing and a US one — so a request that names neither is
+answered from the US tape by default. Stating both with different markets is a 400
+`venue-conflict` rather than a preference for one.
+
 ### `POST /prices`
 
 ```json
-{ "symbols": ["AAPL","MSFT"], "venue": "US", "asset_class": null, "max_age_seconds": 300 }
+{ "symbols": ["AAPL","MSFT"], "country_code": "US", "asset_class": null, "max_age_seconds": 300 }
 ```
 
-Answers with `quotes`, `fetched`, `missing`, `deferred`, `route`, `complete`.
+Answers with `quotes`, `venue`, `fetched`, `missing`, `deferred`, `route`, `complete`. One
+request is one market: a list whose symbols carry two different suffixes is 400 `mixed-venues`,
+so send one country per call.
 
 **`route` is the important field.** The service chooses bulk or per-symbol from the list length
 because the tariff breaks even at 100 symbols. A 2,757-name scan costs 100 units; six positions
@@ -94,7 +102,7 @@ cost 6. Neither caller has to know.
 
 ```json
 { "symbols": ["AAPL"], "period": 14, "method": "tr", "smoothing": "simple",
-  "venue": "US", "asset_class": null,
+  "country_code": "US", "asset_class": null,
   "price": 343.83, "multiplier": 1.0, "direction": "long" }
 ```
 
@@ -110,7 +118,7 @@ supplied.
 ### `POST /bars`
 
 ```json
-{ "symbols": ["AAPL"], "sessions": 15, "venue": "US", "allow_fetch": true }
+{ "symbols": ["AAPL"], "sessions": 15, "country_code": "US", "allow_fetch": true }
 ```
 
 Answers with `as_of_session`, `sessions`, `adjusted`, `provider`, `rows[]`.
@@ -125,6 +133,7 @@ is harmless but it hides the fact that the guarantee lives in the service.
 | Status | Meaning | What to do |
 |---|---|---|
 | 400 | bad request (incomplete stop, bad method, no symbols) | fix the call — it will not succeed on retry |
+| 400 `unknown-venue` / `venue-conflict` / `mixed-venues` | the market could not be resolved | fix the call: one country per request, and no suffix that contradicts it |
 | 404 | that symbol cannot be priced | mark it missing, move on |
 | 502 | the vendor refused | retry later, or fall back to the broker |
 | 503 `database-busy` | the daily load held a lock | **retry** — it is transient and short |
@@ -149,7 +158,12 @@ seconds returns immediately instead of hanging. Treat it as retryable rather tha
    market, ~2 MB). If McTrader only needs the top N movers, sort locally rather than asking for a
    narrower list — a narrower list may drop below the 100-symbol break-even and become *more*
    expensive.
-5. **Crypto uses `asset_class: "crypto"`.** A bare `venue` is meaningless there and is ignored.
+5. **Crypto uses `asset_class: "crypto"`.** A bare `venue`/`country_code` is meaningless there and
+   is ignored.
+6. **A country code is not decoration.** `CBA`, `BHP`, `BXB` are ASX tickers *and* US ones. Pass
+   `country_code` (or suffix the symbol) on `/price`, `/prices`, `/atr` and `/bars`; with neither,
+   the request is answered from the US tape. A contradiction is 400 `venue-conflict`, never a
+   silent pick.
 
 ---
 
