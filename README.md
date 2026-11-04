@@ -1,4 +1,5 @@
-# McTrader_Market_Data_Service
+# McTrader_Market_Data_Service - Python
+# Superseded by McTrader-Market-Data-Service - Rust
 
 One price cache, one daily bar cache, one ATR definition, one EODHD key — behind four
 endpoints, for Mini-McTrader, PaperTrader, PortfolioAdvisor and McTrader.
